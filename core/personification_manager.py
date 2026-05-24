@@ -332,8 +332,9 @@ class PersonificationManager:
             # 使用AstrBot的Provider Manager调用LLM
             provider_manager = self.context.provider_manager
             
-            # 获取当前启用的provider
-            curr_provider = provider_manager.curr_provider
+            # 获取当前启用的provider（正确的方式）
+            from astrbot.core.provider.entities import ProviderType
+            curr_provider = provider_manager.get_using_provider(ProviderType.CHAT_COMPLETION)
             
             if not curr_provider:
                 logger.error("[PersonificationManager] 没有可用的LLM Provider")
