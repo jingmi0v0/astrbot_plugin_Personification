@@ -284,7 +284,7 @@ class PersonificationPlugin(Star):
         try:
             # 获取发送者ID和会话类型
             sender_id = event.get_sender_id()
-            is_group = event.get_event_type() == "group_message"
+            is_group = bool(event.get_group_id())  # 如果有group_id则是群聊
             session_id = event.get_group_id() if is_group else sender_id
             
             # 检查是否在黑名单中

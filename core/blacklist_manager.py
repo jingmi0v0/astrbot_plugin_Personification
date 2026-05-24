@@ -2,8 +2,10 @@
 黑名单管理器 - 管理用户和群的黑名单
 """
 import time
+from pathlib import Path
 from typing import Dict, List, Optional
 from astrbot.api import logger
+from astrbot.core.utils.astrbot_path import get_astrbot_data_path
 
 
 class BlacklistManager:
@@ -26,9 +28,10 @@ class BlacklistManager:
         """从数据库加载黑名单数据"""
         try:
             import sqlite3
-            from pathlib import Path
             
-            db_path = "data/personification.db"
+            # 使用 AstrBot 的 data 目录
+            data_dir = get_astrbot_data_path()
+            db_path = str(Path(data_dir) / "plugins" / "personification.db")
             db_file = Path(db_path)
             
             if not db_file.exists():
@@ -135,10 +138,11 @@ class BlacklistManager:
         """保存黑名单到数据库"""
         try:
             import sqlite3
-            from pathlib import Path
             import time
             
-            db_path = "data/personification.db"
+            # 使用 AstrBot 的 data 目录
+            data_dir = get_astrbot_data_path()
+            db_path = str(Path(data_dir) / "plugins" / "personification.db")
             db_file = Path(db_path)
             
             conn = sqlite3.connect(str(db_file))
@@ -160,9 +164,10 @@ class BlacklistManager:
         """从数据库中删除黑名单记录"""
         try:
             import sqlite3
-            from pathlib import Path
             
-            db_path = "data/personification.db"
+            # 使用 AstrBot 的 data 目录
+            data_dir = get_astrbot_data_path()
+            db_path = str(Path(data_dir) / "plugins" / "personification.db")
             db_file = Path(db_path)
             
             conn = sqlite3.connect(str(db_file))

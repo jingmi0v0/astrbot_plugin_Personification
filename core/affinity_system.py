@@ -2,8 +2,10 @@
 好感度系统 - 管理用户好感度
 """
 import time
+from pathlib import Path
 from typing import Dict, Optional
 from astrbot.api import logger
+from astrbot.core.utils.astrbot_path import get_astrbot_data_path
 
 
 class AffinitySystem:
@@ -39,9 +41,10 @@ class AffinitySystem:
         """从数据库加载好感度数据"""
         try:
             import sqlite3
-            from pathlib import Path
             
-            db_path = "data/personification.db"
+            # 使用 AstrBot 的 data 目录
+            data_dir = get_astrbot_data_path()
+            db_path = str(Path(data_dir) / "plugins" / "personification.db")
             db_file = Path(db_path)
             
             if not db_file.exists():
@@ -121,10 +124,11 @@ class AffinitySystem:
         """保存好感度到数据库"""
         try:
             import sqlite3
-            from pathlib import Path
             import time
             
-            db_path = "data/personification.db"
+            # 使用 AstrBot 的 data 目录
+            data_dir = get_astrbot_data_path()
+            db_path = str(Path(data_dir) / "plugins" / "personification.db")
             db_file = Path(db_path)
             
             conn = sqlite3.connect(str(db_file))
