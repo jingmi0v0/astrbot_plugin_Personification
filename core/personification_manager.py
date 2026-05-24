@@ -57,7 +57,7 @@ class PersonificationManager:
         """处理收到的消息"""
         try:
             sender_id = event.get_sender_id()
-            is_group = event.get_event_type() == "group_message"
+            is_group = bool(event.get_group_id())  # 如果有group_id则是群聊
             session_id = event.get_group_id() if is_group else sender_id
             
             # 检查是否处于闭嘴状态
@@ -144,7 +144,7 @@ class PersonificationManager:
         """判断是否需要回复"""
         message_str = event.message_str
         sender_id = event.get_sender_id()
-        is_group = event.get_event_type() == "group_message"
+        is_group = bool(event.get_group_id())  # 如果有group_id则是群聊
         
         # 检查是否有预设的触发条件
         if session_id in self.next_reply_conditions:
