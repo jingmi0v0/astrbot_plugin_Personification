@@ -5,7 +5,7 @@
 import sqlite3
 from pathlib import Path
 from astrbot.api import logger
-from astrbot.core.utils.path_utils import get_data_dir
+from astrbot.core.utils.astrbot_path import get_astrbot_data_path
 
 
 async def init_database(db_path: str = None):
@@ -16,8 +16,8 @@ async def init_database(db_path: str = None):
     """
     if not db_path:
         # 使用 AstrBot 的 data 目录
-        data_dir = get_data_dir()
-        db_path = str(data_dir / "plugins" / "personification.db")
+        data_dir = get_astrbot_data_path()
+        db_path = str(Path(data_dir) / "plugins" / "personification.db")
     
     try:
         # 确保目录存在
