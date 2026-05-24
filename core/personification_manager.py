@@ -81,12 +81,11 @@ class PersonificationManager:
                 logger.debug(f"[PersonificationManager] Session {session_id} 不需要回复")
                 return
             
-            # 生成回复
-            result = await self._generate_and_send_reply(event, session_id, trigger_reason)
+            # 阻止AstrBot的默认LLM回复
+            event.stop_event()
             
-            # 如果有返回结果，发送它
-            if result:
-                await event.send(result)
+            # 生成回复
+            await self._generate_and_send_reply(event, session_id, trigger_reason)
             
         except Exception as e:
             logger.error(f"[PersonificationManager] 处理消息失败: {e}", exc_info=True)
@@ -224,11 +223,15 @@ class PersonificationManager:
     async def _generate_and_send_reply(self, event: AstrMessageEvent, session_id: str, trigger_reason: str):
         """生成并发送回复"""
         try:
+            logger.info(f"[PersonificationManager] 开始生成回复，trigger_reason={trigger_reason}")
+            
             # 构建提示词
             prompt = await self._build_prompt(event, session_id, trigger_reason)
+            logger.debug(f"[PersonificationManager] 提示词长度: {len(prompt)}")
             
             # 调用LLM生成回复
             reply_content = await self._call_llm(prompt)
+            logger.info(f"[PersonificationManager] LLM返回内容长度: {len(reply_content) if reply_content else 0}")
             
             if not reply_content:
                 logger.warning("[PersonificationManager] LLM返回空回复")
@@ -236,6 +239,7 @@ class PersonificationManager:
             
             # 解析回复内容
             parsed_reply = self._parse_reply(reply_content)
+            logger.debug(f"[PersonificationManager] 解析结果: messages={len(parsed_reply.get('messages', []))}")
             
             # 更新状态
             if 'status' in parsed_reply:
@@ -247,7 +251,11 @@ class PersonificationManager:
             
             # 发送消息
             if 'messages' in parsed_reply and parsed_reply['messages']:
+                logger.info(f"[PersonificationManager] 准备发送 {len(parsed_reply['messages'])} 条消息")
                 await self._send_messages(parsed_reply['messages'], event, session_id)
+                logger.info("[PersonificationManager] 消息发送完成")
+            else:
+                logger.warning("[PersonificationManager] 没有可发送的消息")
             
             # 更新好感度
             await self._update_affinity(event, parsed_reply)
@@ -531,7 +539,10 @@ class PersonificationManager:
     async def _send_text_message(self, content: str, event: AstrMessageEvent):
         """发送文本消息"""
         if content:
+            logger.info(f"[PersonificationManager] 发送文本消息: {content[:50]}...")
+            from astrbot.core.message.components import Plain
             await event.send(Plain(content))
+            logger.info("[PersonificationManager] 文本消息发送成功")
     
     async def _send_image_message(self, message: dict, event: AstrMessageEvent):
         """发送图片消息"""
