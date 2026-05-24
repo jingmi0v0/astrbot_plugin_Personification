@@ -278,7 +278,7 @@ class PersonificationPlugin(Star):
             logger.error(f"[Personification] 查看动态失败: {e}")
             yield event.plain_result(f"查看失败: {str(e)}")
     
-    @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE | filter.EventMessageType.FRIEND_MESSAGE)
+    @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE | filter.EventMessageType.PRIVATE_MESSAGE)
     async def on_message(self, event: AstrMessageEvent):
         """处理消息事件"""
         try:
