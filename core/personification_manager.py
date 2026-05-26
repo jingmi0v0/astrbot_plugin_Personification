@@ -183,7 +183,7 @@ class PersonificationManager:
         if hasattr(event.message_obj, 'message_chain'):
             for component in event.message_obj.message_chain:
                 if isinstance(component, At):
-                    if component.qq == self.context.bot_self_id:
+                    if component.qq == event.get_self_id():
                         return True
         
         return False
@@ -346,7 +346,8 @@ class PersonificationManager:
                 session_id="personification_temp"
             )
             
-            return result.get('completion', '') if result else ''
+            # LLMResponse 对象有 completion_text 属性
+            return result.completion_text if result else ''
             
         except Exception as e:
             logger.error(f"[PersonificationManager] 调用LLM失败: {e}")
