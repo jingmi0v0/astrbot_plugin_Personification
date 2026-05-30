@@ -543,7 +543,8 @@ class PersonificationManager:
         if content:
             logger.info(f"[PersonificationManager] 发送文本消息: {content[:50]}...")
             from astrbot.core.message.components import Plain
-            await event.send(Plain(content))
+            from astrbot.core.message.message_event_result import MessageChain
+            await event.send(MessageChain([Plain(content)]))
             logger.info("[PersonificationManager] 文本消息发送成功")
     
     async def _send_image_message(self, message: dict, event: AstrMessageEvent):
