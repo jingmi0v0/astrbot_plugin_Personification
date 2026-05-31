@@ -11,8 +11,9 @@ from astrbot.core.utils.astrbot_path import get_astrbot_data_path
 class AffinitySystem:
     """好感度系统，管理用户对机器人的好感度"""
     
-    def __init__(self, context):
+    def __init__(self, context, plugin_config=None):
         self.context = context
+        self.plugin_config = plugin_config or {}
         self.affinity_cache: Dict[str, int] = {}  # user_id -> affinity_value
         
         # 配置参数
@@ -24,9 +25,8 @@ class AffinitySystem:
         """初始化好感度系统"""
         logger.info("[AffinitySystem] 正在初始化...")
         
-        # 从配置加载默认值
-        config = self.context.get_config()
-        affinity_config = config.get('affinity', {})
+        # 从插件配置加载默认值
+        affinity_config = self.plugin_config.get('affinity', {})
         
         self.default_affinity = affinity_config.get('default_value', 0)
         self.min_affinity = affinity_config.get('min_value', -100)

@@ -282,15 +282,22 @@ class PersonificationManager:
         # 获取长期记忆（如果有）
         long_memory = await self._get_long_memory(session_id)
         
+        # 预处理模板：将 {long_memory('guild')} 这样的函数调用替换为简单占位符
+        processed_template = re.sub(r'\{long_memory\([^)]*\)\}', '{long_memory}', self.input_template)
+        
         # 填充模板
-        prompt = self.input_template.format(
-            time=current_time,
-            trigger_reason=trigger_reason,
-            history_new=history.get('recent', ''),
-            history_last=history.get('last', ''),
-            status=status,
-            long_memory=long_memory
-        )
+        try:
+            prompt = processed_template.format(
+                time=current_time,
+                trigger_reason=trigger_reason,
+                history_new=history.get('recent', ''),
+                history_last=history.get('last', ''),
+                status=status,
+                long_memory=long_memory
+            )
+        except KeyError as e:
+            logger.warning(f"[PersonificationManager] 模板包含未知占位符: {e}")
+            prompt = processed_template
         
         # 添加系统提示
         full_prompt = f"{self.system_prompt}\n\n{prompt}"

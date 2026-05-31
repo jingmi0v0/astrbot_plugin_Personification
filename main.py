@@ -42,11 +42,20 @@ class PersonificationPlugin(Star):
         # 初始化数据库
         await init_database()
         
-        # 加载配置
-        self.config = self.context.get_config()
+        # 加载插件自身配置（config.yml）
+        import yaml
+        from pathlib import Path
+        config_path = Path(__file__).parent / "config.yml"
+        if config_path.exists():
+            with open(config_path, "r", encoding="utf-8") as f:
+                self.config = yaml.safe_load(f) or {}
+            logger.info(f"[Personification] 已加载配置: {config_path}, name={self.config.get('name', 'N/A')}")
+        else:
+            self.config = {}
+            logger.warning(f"[Personification] 配置文件不存在: {config_path}")
         
         # 初始化好感度系统
-        self.affinity_system = AffinitySystem(self.context)
+        self.affinity_system = AffinitySystem(self.context, self.config)
         await self.affinity_system.initialize()
         
         # 初始化黑名单管理器
