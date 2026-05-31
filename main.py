@@ -299,6 +299,11 @@ class PersonificationPlugin(Star):
             # 处理拟人化回复
             await self.personification_manager.handle_message(event)
             
+            # 如果事件已被处理，阻止后续传播
+            if event.get_extra("astrbot_personification_handled", False):
+                event.stop_event()
+                logger.debug(f"[Personification] 事件已处理，阻止AstrBot默认回复")
+            
         except Exception as e:
             logger.error(f"[Personification] 处理消息失败: {e}")
     

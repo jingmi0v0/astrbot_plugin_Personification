@@ -348,7 +348,8 @@ class PersonificationManager:
             system_prompt = parts[0] if len(parts) > 1 else ""
             user_prompt = parts[1] if len(parts) > 1 else prompt
             
-            logger.debug(f"[PersonificationManager] System Prompt长度: {len(system_prompt)}, User Prompt长度: {len(user_prompt)}")
+            logger.info(f"[PersonificationManager] System Prompt长度: {len(system_prompt)}, 前50字符: {system_prompt[:50]}")
+            logger.info(f"[PersonificationManager] User Prompt长度: {len(user_prompt)}, 前50字符: {user_prompt[:50]}")
             
             # 调用LLM，传递 system_prompt
             result = await curr_provider.text_chat(
