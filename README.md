@@ -10,6 +10,19 @@
 ```text
 mcap163@163.com
 ```
+- 本插件不支持在web编辑
+- 需要一定的动手能力
+- 请自己去文件修改配置
+- （Linux目录：/root/AstrBot/data/plugins/astrbot_plugin_personification/config.yml）
+- win系统同理
+
+- 该插件不支持以及不适配或有可能冲突的插件：
+- **[QQ Space Plugin](https://github.com/Zhalslar/astrbot_plugin_qzone)** - QQ空间
+- **[LivelyState](https://github.com/KonmaKanSinPack/astrbot_plugin_LivelyState)** - 角色记忆等具有长期记忆的功能
+- **[智能贴表情](astrbot_plugin_emoji_like)** 任何具有修改LLM消息的插件
+- **[拟人化角色系统](https://github.com/LMG-arch/astrbot-plugin-realistic-persona)** - 任何可以调用QQ空间和以及其他的插件
+
+
 ## 插件特色
 
 ### 🎭 拟人化聊天
