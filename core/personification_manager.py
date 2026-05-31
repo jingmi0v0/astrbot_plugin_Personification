@@ -83,6 +83,8 @@ class PersonificationManager:
             
             # 阻止AstrBot的默认LLM回复
             event.stop_event()
+            # 设置标志，确保后续阶段也不会处理
+            event.set_extra("astrbot_personification_handled", True)
             
             # 生成回复
             await self._generate_and_send_reply(event, session_id, trigger_reason)
@@ -340,10 +342,19 @@ class PersonificationManager:
                 logger.error("[PersonificationManager] 没有可用的LLM Provider")
                 return ""
             
-            # 调用LLM
+            # 分离 system_prompt 和 user_prompt
+            # prompt 格式为: "{system_prompt}\n\n{user_prompt}"
+            parts = prompt.split("\n\n", 1)
+            system_prompt = parts[0] if len(parts) > 1 else ""
+            user_prompt = parts[1] if len(parts) > 1 else prompt
+            
+            logger.debug(f"[PersonificationManager] System Prompt长度: {len(system_prompt)}, User Prompt长度: {len(user_prompt)}")
+            
+            # 调用LLM，传递 system_prompt
             result = await curr_provider.text_chat(
-                prompt=prompt,
-                session_id="personification_temp"
+                prompt=user_prompt,
+                session_id="personification_temp",
+                system_prompt=system_prompt
             )
             
             # LLMResponse 对象有 completion_text 属性
@@ -544,8 +555,11 @@ class PersonificationManager:
             logger.info(f"[PersonificationManager] 发送文本消息: {content[:50]}...")
             from astrbot.core.message.components import Plain
             from astrbot.core.message.message_event_result import MessageChain
-            await event.send(MessageChain([Plain(content)]))
-            logger.info("[PersonificationManager] 文本消息发送成功")
+            try:
+                await event.send(MessageChain([Plain(content)]))
+                logger.info("[PersonificationManager] 文本消息发送成功")
+            except Exception as e:
+                logger.error(f"[PersonificationManager] 发送消息失败: {e}")
     
     async def _send_image_message(self, message: dict, event: AstrMessageEvent):
         """发送图片消息"""
