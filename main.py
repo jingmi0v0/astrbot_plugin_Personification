@@ -34,7 +34,22 @@ class PersonificationPlugin(Star):
         
         # 插件配置
         self.config = None
+        self._config_path = None
         
+    def _load_config(self) -> dict:
+        """加载/重新加载 config.yml"""
+        import yaml
+        if self._config_path is None:
+            self._config_path = Path(__file__).parent / "config.yml"
+        if self._config_path.exists():
+            with open(self._config_path, "r", encoding="utf-8") as f:
+                config = yaml.safe_load(f) or {}
+            logger.info(f"[Personification] 已加载配置: {self._config_path}, name={config.get('name', 'N/A')}")
+            return config
+        else:
+            logger.warning(f"[Personification] 配置文件不存在: {self._config_path}")
+            return {}
+    
     async def initialize(self):
         """插件初始化"""
         logger.info("[Personification] 正在初始化拟人化插件...")
@@ -43,16 +58,7 @@ class PersonificationPlugin(Star):
         await init_database()
         
         # 加载插件自身配置（config.yml）
-        import yaml
-        from pathlib import Path
-        config_path = Path(__file__).parent / "config.yml"
-        if config_path.exists():
-            with open(config_path, "r", encoding="utf-8") as f:
-                self.config = yaml.safe_load(f) or {}
-            logger.info(f"[Personification] 已加载配置: {config_path}, name={self.config.get('name', 'N/A')}")
-        else:
-            self.config = {}
-            logger.warning(f"[Personification] 配置文件不存在: {config_path}")
+        self.config = self._load_config()
         
         # 初始化好感度系统
         self.affinity_system = AffinitySystem(self.context, self.config)
@@ -80,6 +86,35 @@ class PersonificationPlugin(Star):
         await self.qzone_system.initialize()
         
         logger.info("[Personification] 拟人化插件初始化完成")
+    
+    @filter.command("重载配置")
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    async def reload_config(self, event: AstrMessageEvent):
+        """重新加载 config.yml 配置（无需重启插件）"""
+        try:
+            old_name = self.config.get('name', 'N/A')
+            
+            # 重新加载配置
+            self.config = self._load_config()
+            new_name = self.config.get('name', 'N/A')
+            
+            # 更新各子系统的配置引用
+            if self.personification_manager:
+                self.personification_manager.reload_config(self.config)
+            
+            if self.affinity_system:
+                self.affinity_system.plugin_config = self.config
+                await self.affinity_system.initialize()
+            
+            if self.qzone_system:
+                self.qzone_system.config = self.config
+            
+            logger.info(f"[Personification] 配置重载完成: {old_name} -> {new_name}")
+            yield event.plain_result(f"✅ 配置重载成功\n角色: {old_name} -> {new_name}")
+            
+        except Exception as e:
+            logger.error(f"[Personification] 重载配置失败: {e}")
+            yield event.plain_result(f"❌ 重载配置失败: {str(e)}")
     
     @filter.command("设置好感度")
     @filter.permission_type(filter.PermissionType.ADMIN)

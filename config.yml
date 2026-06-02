@@ -443,5 +443,42 @@ qzone:
 # 行为控制配置
 max_messages: 40          # 最大历史消息数
 activity_threshold: 0.3   # 群聊活跃度触发阈值（0-1）
-mute_time: 60             # 闭嘴时长（秒）
-typing_time: 1            # 模拟打字延迟（秒）
+mute_time: 60             # 闭嘴时长（单位：秒）
+
+# 模拟打字延迟配置
+typing_time: 3            # 每条消息之间的打字延迟（单位：秒）
+typing_per_char: 0.1      # 按字数计算的打字延迟（单位：秒/字），与typing_time叠加使用
+
+# 休息系统配置
+rest:
+  # 固定休息时间（24小时制，在指定时间段内不回复）
+  fixed:
+    enabled: true
+    schedules:
+      - start: "00:00"    # 休息开始时间
+        end: "07:30"      # 休息结束时间
+      - start: "12:00"    # 午休开始时间
+        end: "13:00"      # 午休结束时间
+
+  # 随机休息时间（随机进入“休息”状态，一段时间内不回复）
+  random:
+    enabled: true          # 是否启用随机休息
+    min_duration: 300      # 最短休息时间（单位：秒）
+    max_duration: 1800     # 最长休息时间（单位：秒）
+    check_interval: 600    # 检查频率（单位：秒，每隔多久检查一次是否触发休息）
+    trigger_probability: 0.15  # 每次检查时触发休息的概率（0-1，0.15即15%）
+
+  # 休息中被唤醒配置（固定休息时段有人一直找，有概率被唤醒但神志不清）
+  wakeup:
+    enabled: true              # 是否启用唤醒功能
+    message_threshold: 3       # 休息期间累计多少条消息后开始尝试唤醒
+    wakeup_probability: 0.3    # 达到阈值后每次消息触发唤醒的概率（0-1）
+    awake_duration: 180        # 唤醒后持续多久又睡着（单位：秒）
+    groggy_system_prompt: |    # 被唤醒时的额外系统提示（让LLM表现得神志不清）
+      你刚刚被吵醒，现在非常困，意识模糊，说话含混不清。
+      你的回复应该：
+      - 语句不完整，经常省略号
+      - 可能会说错字、重复、或答非所问
+      - 语气很困很累，想继续睡
+      - 回复要短，不超过20字
+      - 可以抱怨被吵醒
