@@ -64,6 +64,9 @@ class PersonificationManager:
         # 说话频率限制（冷却状态）
         self.speak_cooldown_state: Dict[str, float] = {}  # session_id -> cooldown_until_timestamp
 
+        # 历史去重缓存（chatluna-character 风格，检测前后轮消息重叠）
+        self._history_dedup_cache: Dict[str, list] = {}
+
     async def initialize(self):
         """初始化拟人化管理器"""
         # 设置日志级别配置提供器
@@ -235,7 +238,7 @@ class PersonificationManager:
         return False
 
     async def _save_message_to_history(self, event: AstrMessageEvent, session_id: str):
-        """保存消息到历史记录"""
+        """保存消息到历史记录（含超阈值压缩）"""
         if session_id not in self.message_history:
             self.message_history[session_id] = []
 
@@ -254,10 +257,21 @@ class PersonificationManager:
 
         self.message_history[session_id].append(message_record)
 
-        # 限制历史记录数量
+        # 历史压缩：超过 max_messages × 2 时，压缩旧消息
         max_messages = self.config.get('max_messages', 40)
-        if len(self.message_history[session_id]) > max_messages:
-            self.message_history[session_id] = self.message_history[session_id][-max_messages:]
+        compress_threshold = max_messages * 2
+        if len(self.message_history[session_id]) > compress_threshold:
+            keep = self.message_history[session_id][-max_messages:]
+            # 用一条压缩标记替换旧消息
+            compression_marker = {
+                'sender_id': 'system',
+                'sender_name': 'System',
+                'content': '[对话历史已压缩，保留最近的重要消息]',
+                'timestamp': keep[0]['timestamp'] if keep else timestamp,
+                'is_compressed': True
+            }
+            self.message_history[session_id] = [compression_marker] + keep
+            logger.info(f"[PersonificationManager] Session {session_id} 历史已压缩 ({compress_threshold} -> {len(self.message_history[session_id])} 条)")
 
         # 更新会话元信息（最后互动时间）
         self.session_meta[session_id] = {
@@ -475,8 +489,11 @@ class PersonificationManager:
             if not is_groggy and 'actions' in parsed_reply:
                 await self._execute_actions(parsed_reply['actions'], event)
 
-            # 发送消息
+            # 对消息做拟人化处理：拆分长消息，使其更像真人分段发送
             if 'messages' in parsed_reply and parsed_reply['messages']:
+                parsed_reply['messages'] = self._humanize_messages(
+                    parsed_reply['messages'], is_group
+                )
                 logger.reply(f"准备发送 {len(parsed_reply['messages'])} 条消息")
                 await self._send_messages(parsed_reply['messages'], event, session_id)
                 logger.info("[PersonificationManager] 消息发送完成")
@@ -540,31 +557,76 @@ class PersonificationManager:
             logger.warning(f"[PersonificationManager] 模板包含未知占位符: {e}")
             user_prompt = processed_template
 
-        # 系统提示直接返回，不再拼接后拆分（避免 system 内部空行导致截断）
+        # 系统提示直接返回，不再拼接后拆分
         system_prompt = self.system_prompt
+
+        # 追加安全规则（从 config 读取，用户可自定义）
+        safety_rules = self.config.get('safety_rules', '').strip()
+        if safety_rules:
+            system_prompt += f"\n\n{safety_rules}"
 
         return user_prompt, system_prompt
 
+    @staticmethod
+    def _xml_escape(text: str) -> str:
+        """转义 XML 特殊字符"""
+        return text.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;').replace("'", '&apos;').replace('"', '&quot;')
+
+    def _format_message_xml(self, message: dict) -> str:
+        """格式化单条消息为 XML 格式（移植自 chatluna-character）"""
+        name = self._xml_escape(message.get('sender_name', 'Unknown'))
+        sender_id = message.get('sender_id', '')
+        timestamp = message.get('timestamp', 0)
+        content = self._xml_escape(message.get('content', ''))
+
+        # 格式与 chatluna-character 一致：<message name='X' id='Y' timestamp='Z'>content</message>
+        ts_str = ''
+        if timestamp:
+            dt = datetime.fromtimestamp(timestamp)
+            ts_str = dt.strftime('%m/%d/%Y, %H:%M:%S') + ' GMT+8'
+
+        xml = f"<message name='{name}'"
+        if sender_id:
+            xml += f" id='{sender_id}'"
+        if ts_str:
+            xml += f" timestamp='{ts_str}'"
+        xml += f">{content}</message>"
+        return xml
+
     def _format_history(self, session_id: str) -> dict:
-        """格式化历史记录"""
+        """格式化历史记录为 XML 消息格式（移植自 chatluna-character）"""
         if session_id not in self.message_history:
             return {'recent': '', 'last': ''}
 
         messages = self.message_history[session_id]
-
         if not messages:
             return {'recent': '', 'last': ''}
 
-        # 最近的消息
-        recent_messages = messages[-10:] if len(messages) > 10 else messages
-        recent_text = "\n".join([
-            f"{m['sender_name']}: {m['content']}"
-            for m in recent_messages
-        ])
+        # 全部转为 XML 格式
+        formatted = [self._format_message_xml(m) for m in messages]
 
-        # 最后一条消息
-        last_message = messages[-1]
-        last_text = f"{last_message['sender_name']}: {last_message['content']}"
+        # 历史去重缓存（用于检测重叠）
+        max_msgs = self.config.get('max_messages', 40)
+        cache_key = f'{session_id}'
+        last_cache = self._history_dedup_cache.get(cache_key, [])
+
+        # 检测重叠：从后往前比较，找到不重叠的部分
+        recent_formatted = formatted[-max_msgs:]
+        if last_cache and len(last_cache) <= len(recent_formatted):
+            overlap = 0
+            for i in range(1, min(len(last_cache), len(recent_formatted)) + 1):
+                if last_cache[-i] == recent_formatted[i - 1]:
+                    overlap = i
+                else:
+                    break
+            if overlap > 0 and overlap < len(recent_formatted):
+                recent_formatted = ['...'] + recent_formatted[overlap:]
+
+        # 更新缓存
+        self._history_dedup_cache[cache_key] = formatted[-max_msgs:]
+
+        recent_text = "\n".join(recent_formatted)
+        last_text = formatted[-1] if formatted else ''
 
         return {
             'recent': recent_text,
@@ -826,10 +888,50 @@ class PersonificationManager:
             await self.blacklist_manager.add_to_blacklist(user_id, f"好感度过低({new_affinity})自动拉黑")
             logger.info(f"[PersonificationManager] 用户 {user_id} 因好感度过低被自动拉黑")
 
+    @staticmethod
+    def _humanize_messages(messages: list, is_group: bool) -> list:
+        """拟人化消息处理：拆分长消息为多条短消息，使其更像真人分段发送"""
+        max_len = 20 if is_group else 40  # 群聊更短，私聊稍长
+        result = []
+        for msg in messages:
+            if msg['type'] != 'text' or not msg.get('content'):
+                result.append(msg)
+                continue
+            content = msg['content'].strip()
+            if len(content) <= max_len:
+                result.append(msg)
+                continue
+            # 长消息按标点或空格拆分为多条短消息
+            import re
+            # 优先在句号/问号/感叹号/换行处拆分
+            segments = re.split(r'(?<=[。！？.!?\n])', content)
+            segments = [s.strip() for s in segments if s.strip()]
+            if len(segments) <= 1:
+                # 没有合适分隔符，按最大长度硬切
+                segments = [content[i:i+max_len] for i in range(0, len(content), max_len)]
+            for seg in segments:
+                if len(seg) > max_len:
+                    # 仍然超长，继续切
+                    sub_segs = [seg[i:i+max_len] for i in range(0, len(seg), max_len)]
+                    for sub in sub_segs:
+                        result.append({'type': 'text', 'content': sub.strip()})
+                else:
+                    result.append({'type': 'text', 'content': seg})
+        return result
+
     async def _send_messages(self, messages: list, event: AstrMessageEvent, session_id: str):
-        """发送消息（先模拟打字延迟，再发送）"""
+        """发送消息（先模拟打字延迟，再发送），自动去重连续相同内容"""
+        last_text = None
         for i, message in enumerate(messages):
             try:
+                # 去重：跳过与上一条完全相同的文本消息
+                if message['type'] == 'text':
+                    current_text = message.get('content', '')
+                    if current_text and current_text == last_text:
+                        logger.debug(f"[PersonificationManager] 跳过重复消息: {current_text[:30]}...")
+                        continue
+                    last_text = current_text
+
                 # 模拟打字延迟：发送前等待，模拟思考和键入时间
                 typing_base = self.config.get('typing_time', 3)
                 typing_per_char = self.config.get('typing_per_char', 0.1)
