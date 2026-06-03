@@ -346,6 +346,7 @@ class PersonificationPlugin(Star):
             # 如果事件已被处理，阻止后续传播
             if event.get_extra("astrbot_personification_handled", False):
                 event.stop_event()
+                event.should_call_llm(True)  # 阻止 AstrBot 默认 LLM Agent 再回复同一条消息
                 logger.debug(f"[Personification] 事件已处理，阻止AstrBot默认回复")
             
         except Exception as e:

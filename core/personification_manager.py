@@ -67,6 +67,15 @@ class PersonificationManager:
         # 历史去重缓存（chatluna-character 风格，检测前后轮消息重叠）
         self._history_dedup_cache: Dict[str, list] = {}
 
+        # 被@但没说话的状态跟踪（沉默@计时器）
+        self._pending_silent_mentions: Dict[str, asyncio.Task] = {}  # key: "{session_id}_{sender_id}" -> asyncio.Task
+
+        # 无厘头/不完整消息的等待计时器
+        self._pending_confused_timers: Dict[str, asyncio.Task] = {}  # key: "{session_id}_{sender_id}" -> asyncio.Task
+
+        # 活跃对话状态（被@一次后保持回复，无需重复@）
+        self.active_conversations: Dict[str, dict] = {}  # session_id -> {user_id, other_msgs_count, last_reply_time}
+
     async def initialize(self):
         """初始化拟人化管理器"""
         # 设置日志级别配置提供器
@@ -124,11 +133,33 @@ class PersonificationManager:
             except Exception:
                 pass
 
+            # 活跃对话：其他人发消息时计数，超过阈值则结束对话
+            active_conv = self.active_conversations.get(session_id)
+            if active_conv:
+                if sender_id != active_conv['user_id']:
+                    active_conv['other_msgs_count'] += 1
+                    max_other = self.config.get('active_conv_max_other_msgs', 3)
+                    if active_conv['other_msgs_count'] >= max_other:
+                        del self.active_conversations[session_id]
+                        logger.info(f"[PersonificationManager] 与用户 {active_conv['user_id']} 的活跃对话结束（其他消息过多）")
+                else:
+                    # 对话用户本人的消息：检查是否明确表示不想聊了
+                    msg = event.message_str
+                    if msg:
+                        self._check_conversation_end(msg, session_id)
+
+            # 检查是否有人在沉默@或无厘头消息计时中，有则取消（用户说话了）
+            self._cancel_pending_silent_mention(session_id, sender_id)
+            self._cancel_pending_confused_timer(session_id, sender_id)
+
             # 过滤空消息（如手机端「用户正在输入中」的状态提示，NaoCat 等平台会发送空消息）
+            # 但保留纯@消息（用户@了但没有打字的情况）
             message_str = event.message_str
             if not message_str or not message_str.strip():
-                logger.debug(f"[PersonificationManager] Session {session_id} 收到空消息（可能是输入状态提示），跳过")
-                return
+                if not self._has_at_component(event):
+                    logger.debug(f"[PersonificationManager] Session {session_id} 收到空消息（可能是输入状态提示），跳过")
+                    return
+                # 是纯@消息，message_str 保持空，继续处理
 
             # 检查是否处于闭嘴状态
             if self._is_muted(session_id):
@@ -174,7 +205,7 @@ class PersonificationManager:
                 return
 
             # 说话频率检查：除被@和预设触发外，冷却期内不回复
-            if trigger_reason not in ("mentioned", "next_reply_trigger", "private_chat"):
+            if trigger_reason not in ("mentioned", "mentioned_silent", "active_conversation", "next_reply_trigger", "private_chat"):
                 if self._is_in_speak_cooldown(session_id):
                     logger.debug(f"[PersonificationManager] Session {session_id} 在说话冷却中，跳过回复")
                     return
@@ -188,8 +219,32 @@ class PersonificationManager:
             if is_awake:
                 trigger_reason = "wakeup_groggy"
 
+            # 处理「被@但没说话」的情况：启动沉默计时器
+            if trigger_reason == "mentioned_silent":
+                event.stop_event()
+                event.set_extra("astrbot_personification_handled", True)
+                await self._start_silent_mention_timer(event, session_id, sender_id)
+                return
+
+            # 处理「无厘头/不完整消息」的情况：启动等待计时器
+            # 但在活跃对话中，用户的短消息可能是正常回应，不触发等待
+            if trigger_reason != "active_conversation" and self._is_confusing_message(message_str, session_id, sender_id):
+                event.stop_event()
+                event.set_extra("astrbot_personification_handled", True)
+                await self._start_confused_message_timer(event, session_id, sender_id, message_str)
+                return
+
             # 生成回复
             await self._generate_and_send_reply(event, session_id, trigger_reason)
+
+            # 回复成功后，建立/更新活跃对话（被@、对话中用户无需重复@）
+            if trigger_reason in ("mentioned", "active_conversation", "next_reply_trigger", "private_chat", "wakeup_groggy"):
+                self.active_conversations[session_id] = {
+                    "user_id": sender_id,
+                    "other_msgs_count": 0,
+                    "last_reply_time": time.time()
+                }
+                logger.debug(f"[PersonificationManager] 与用户 {sender_id} 建立活跃对话")
 
         except Exception as e:
             logger.error(f"[PersonificationManager] 处理消息失败: {e}", exc_info=True)
@@ -384,7 +439,17 @@ class PersonificationManager:
 
         # 检查是否被@或提到昵称
         if self._is_mentioned(event):
+            # 区分纯@（没说话）和有文字的@
+            if not message_str or not message_str.strip():
+                return True, "mentioned_silent"
             return True, "mentioned"
+
+        # 检查活跃对话（之前@过机器人，同个用户后续消息无需重复@）
+        if is_group:
+            active_conv = self.active_conversations.get(session_id)
+            if active_conv and sender_id == active_conv['user_id']:
+                active_conv['other_msgs_count'] = 0  # 对话用户说话了，重置计数
+                return True, "active_conversation"
 
         # 群聊中的活跃度判断
         if is_group:
@@ -565,6 +630,18 @@ class PersonificationManager:
         safety_rules = self.config.get('safety_rules', '').strip()
         if safety_rules:
             system_prompt += f"\n\n{safety_rules}"
+
+        # 安全防线：非被@/提及触发的回复（如活跃度随机插话），禁止骂回去
+        # 只有明确被@或提到名字时，才可能是在骂你
+        if trigger_reason and not trigger_reason.startswith("mentioned"):
+            system_prompt += (
+                "\n\n"
+                "## 重要：本次回复是随机插话\n"
+                "- 对方没有@你，也没有提到你的名字。你只是看到群里有消息就接话了。\n"
+                "- 所以对方说的任何话都不是在对你说的，更不可能是在骂你。\n"
+                "- **本条消息严格禁止骂回去、禁止认为对方在攻击你。**\n"
+                "- 保持友善，正常聊天即可。"
+            )
 
         return user_prompt, system_prompt
 
@@ -1201,6 +1278,216 @@ class PersonificationManager:
         return False
 
     # _generate_groggy_reply 已废弃 — groggy 逻辑已内联到 _generate_and_send_reply 中
+
+    # ============ 活跃对话管理 ============
+
+    def _check_conversation_end(self, message_str: str, session_id: str):
+        """检查用户是否明确表示不想聊了，是则结束活跃对话"""
+        if session_id not in self.active_conversations:
+            return
+        end_keywords = self.config.get('active_conv_end_keywords', ['不聊了', '拜拜', '再见', '走了', '下了', '睡了', '先这样'])
+        for kw in end_keywords:
+            if kw in message_str:
+                del self.active_conversations[session_id]
+                logger.info(f"[PersonificationManager] 用户明确结束对话: {kw}")
+                break
+
+    # ============ 沉默@检测 ============
+
+    def _has_at_component(self, event: AstrMessageEvent) -> bool:
+        """检查消息中是否包含@机器人的组件"""
+        if hasattr(event.message_obj, 'message_chain'):
+            for comp in event.message_obj.message_chain:
+                if isinstance(comp, At):
+                    try:
+                        if str(comp.qq) == str(event.get_self_id()):
+                            return True
+                    except Exception:
+                        pass
+        return False
+
+    def _cancel_pending_silent_mention(self, session_id: str, sender_id: str):
+        """取消指定用户的沉默@计时器（用户说话了）"""
+        key = f"{session_id}_{sender_id}"
+        task = self._pending_silent_mentions.pop(key, None)
+        if task is not None:
+            task.cancel()
+            logger.debug(f"[PersonificationManager] 取消 {key} 的沉默@计时器（用户说话了）")
+
+    async def _start_silent_mention_timer(self, event: AstrMessageEvent, session_id: str, sender_id: str):
+        """用户@了但没说话，启动等待计时器"""
+        key = f"{session_id}_{sender_id}"
+        # 取消之前的计时器（如果有）
+        self._cancel_pending_silent_mention(session_id, sender_id)
+        # 启动新的计时器
+        timeout = self.config.get('silent_mention_timeout', 30)
+        task = asyncio.create_task(
+            self._silent_mention_timeout(event, session_id, sender_id, timeout)
+        )
+        self._pending_silent_mentions[key] = task
+        logger.info(f"[PersonificationManager] 用户 {sender_id} 沉默@，启动 {timeout} 秒计时器")
+
+    async def _silent_mention_timeout(self, event: AstrMessageEvent, session_id: str, sender_id: str, timeout: int):
+        """沉默@超时：调用 LLM 按人设@回去询问"""
+        try:
+            await asyncio.sleep(timeout)
+            key = f"{session_id}_{sender_id}"
+            if key not in self._pending_silent_mentions:
+                return  # 已被取消
+            del self._pending_silent_mentions[key]
+
+            logger.info(f"[PersonificationManager] 沉默@超时，回复用户 {sender_id}")
+
+            # 构建简短 prompt，让 LLM 按人设生成回复
+            current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            status = self.status_cache.get(session_id, self.default_status)
+
+            user_prompt = (
+                f"当前时间：{current_time}\n\n"
+                f"用户 @了你，但过了{timeout}秒都没有说任何话。\n"
+                f"请根据你的人设，用简短的语气@回去问他有什么事情。\n"
+                f"回复不超过10个字，保持你的人设风格。\n\n"
+                f"当前状态：\n{status}"
+            )
+
+            reply_content = await self._call_llm(user_prompt, self.system_prompt)
+            if not reply_content:
+                logger.warning("[PersonificationManager] 沉默@回复 LLM 返回空")
+                return
+
+            # 发送 @回复
+            from astrbot.core.message.components import Plain, At
+            from astrbot.core.message.message_event_result import MessageChain
+            try:
+                chain = MessageChain()
+                chain.chain.append(At(qq=sender_id))
+                # 清洗回复：去掉 XML 标签（LLM 可能输出 <output><message>...</message></output>）
+                clean_reply = re.sub(r'<[^>]+>', '', reply_content).strip()
+                chain.chain.append(Plain(f" {clean_reply}"))
+                await event.send(chain)
+                logger.info(f"[PersonificationManager] 沉默@超时回复已发送给 {sender_id}")
+            except Exception as e:
+                logger.error(f"[PersonificationManager] 发送沉默@回复失败: {e}")
+
+        except asyncio.CancelledError:
+            pass  # 被取消，什么都不做
+
+    # ============ 无厘头/不完整消息检测 ============
+
+    def _is_confusing_message(self, message_str: str, session_id: str = None, sender_id: str = None) -> bool:
+        """检测消息是否可能是无厘头/不完整的句子"""
+        text = message_str.strip()
+        if not text:
+            return False
+
+        # 去除 @提及 部分
+        clean_text = re.sub(r'@\S+', '', text).strip()
+        if not clean_text:
+            return False
+
+        # 只有标点符号或特殊字符
+        if all(c in '.,?!;:。，？！；：…~-—、()（）【】""''「」『』《》【】' for c in clean_text):
+            return True
+
+        # 语气词集合
+        filler_words = {'嗯', '哦', '啊', '呃', '唔', '哼', '哈', '嘿', '喂', '哎', '咦', '噢', '欸', '呀'}
+
+        # 如果消息全是语气词（如"嗯""啊""哦"），检查是否在正常对话中
+        # 如果在和机器人对话，"嗯"可能是肯定的回应，不应视为无厘头
+        if len(clean_text) <= 2 and all(c in filler_words for c in clean_text):
+            if session_id and self._is_in_active_conversation(session_id, sender_id):
+                return False  # 在正常对话中，"嗯"是肯定回应
+            return True
+
+        # 太短的消息（1个汉字或2个英文字符）
+        if len(clean_text) <= 1:
+            return True
+
+        return False
+
+    def _is_in_active_conversation(self, session_id: str, sender_id: str) -> bool:
+        """检查用户是否在和机器人进行有意义的对话（最近有机器人的回复）"""
+        history = self.message_history.get(session_id, [])
+        if not history or len(history) < 2:
+            return False
+
+        # 倒序检查最近5条消息
+        recent = history[-5:]
+        for msg in reversed(recent):
+            # 找到机器人的回复
+            if msg.get('is_bot', False):
+                # 检查这个回复的上一条是不是来自该用户（说明在对话）
+                return True
+            # 如果看到该用户的上一条消息前没有机器人回复，不算对话
+        return False
+
+    def _cancel_pending_confused_timer(self, session_id: str, sender_id: str):
+        """取消指定用户的无厘头消息计时器（用户后续说话了）"""
+        key = f"{session_id}_{sender_id}"
+        task = self._pending_confused_timers.pop(key, None)
+        if task is not None:
+            task.cancel()
+            logger.debug(f"[PersonificationManager] 取消 {key} 的无厘头消息计时器（用户说话了）")
+
+    async def _start_confused_message_timer(self, event: AstrMessageEvent, session_id: str, sender_id: str, original_message: str):
+        """用户发了无厘头/不完整消息，启动随机等待计时器"""
+        key = f"{session_id}_{sender_id}"
+        # 取消之前的计时器（如果有）
+        self._cancel_pending_confused_timer(session_id, sender_id)
+
+        # 获取等待配置
+        wait_min = self.config.get('confused_wait_min', 10)
+        wait_max = self.config.get('confused_wait_max', 40)
+        wait_time = random.randint(wait_min, wait_max)
+
+        task = asyncio.create_task(
+            self._confused_message_timeout(event, session_id, sender_id, original_message, wait_time)
+        )
+        self._pending_confused_timers[key] = task
+        logger.info(f"[PersonificationManager] 用户 {sender_id} 发了无厘头消息，等待 {wait_time} 秒")
+
+    async def _confused_message_timeout(self, event: AstrMessageEvent, session_id: str, sender_id: str, original_message: str, wait_time: int):
+        """等待超时：用户没有补充说明，按人设回复"没听懂"类消息"""
+        try:
+            await asyncio.sleep(wait_time)
+            key = f"{session_id}_{sender_id}"
+            if key not in self._pending_confused_timers:
+                return  # 已被取消
+            del self._pending_confused_timers[key]
+
+            logger.info(f"[PersonificationManager] 无厘头消息等待超时（{wait_time}秒），回复用户 {sender_id}")
+
+            # 构建 prompt，让 LLM 按人设生成"没听懂"的回复
+            current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            status = self.status_cache.get(session_id, self.default_status)
+
+            user_prompt = (
+                f"当前时间：{current_time}\n\n"
+                f"用户发了这样一条消息：{original_message}\n"
+                f"你看不懂他想表达什么，等了{wait_time}秒他也没有补充说明。\n"
+                f"请根据你的人设，简短地表示你没听懂/没理解。\n"
+                f"回复不超过10个字，保持你的人设风格。\n\n"
+                f"当前状态：\n{status}"
+            )
+
+            reply_content = await self._call_llm(user_prompt, self.system_prompt)
+            if not reply_content:
+                logger.warning("[PersonificationManager] 无厘头消息回复 LLM 返回空")
+                return
+
+            # 发送回复
+            from astrbot.core.message.components import Plain
+            from astrbot.core.message.message_event_result import MessageChain
+            try:
+                clean_reply = re.sub(r'<[^>]+>', '', reply_content).strip()
+                if clean_reply:
+                    await event.send(MessageChain([Plain(clean_reply)]))
+                    logger.info(f"[PersonificationManager] 无厘头消息超时回复已发送给 {sender_id}")
+            except Exception as e:
+                logger.error(f"[PersonificationManager] 发送无厘头消息回复失败: {e}")
+
+        except asyncio.CancelledError:
+            pass  # 被取消，什么都不做
     
     # ============ 长期记忆操作 ============
     
