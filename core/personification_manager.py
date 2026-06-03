@@ -9,8 +9,8 @@ import time
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
-from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent
+from .plugin_logger import logger, set_config_provider
 from astrbot.core.message.components import Plain, Image, At
 from astrbot.core.utils.astrbot_path import get_astrbot_data_path
 
@@ -57,15 +57,24 @@ class PersonificationManager:
         self.rest_message_count: Dict[str, int] = {}  # session_id -> 休息期间累计消息数
         self.awake_state: Dict[str, float] = {}  # session_id -> awake_until_timestamp（被唤醒后清醒到什么时候）
 
+        # 会话持久化（对话历史 + 情感状态保存到本地 JSON 文件）
+        self.session_data_file_path = Path(get_astrbot_data_path()) / "plugins" / "personification_session_data.json"
+        self.session_meta: Dict[str, dict] = {}  # session_id -> {last_interaction_time, last_sender_id}
+
+        # 说话频率限制（冷却状态）
+        self.speak_cooldown_state: Dict[str, float] = {}  # session_id -> cooldown_until_timestamp
+
     async def initialize(self):
         """初始化拟人化管理器"""
+        # 设置日志级别配置提供器
+        set_config_provider(lambda k, d: self.config.get(k, d))
         logger.info("[PersonificationManager] 正在初始化...")
         # 加载持久化数据（长期记忆等）
         await self._load_persistent_data()
         logger.info("[PersonificationManager] 初始化完成")
 
     async def _load_persistent_data(self):
-        """加载持久化数据"""
+        """加载持久化数据（长期记忆 + 会话历史 + 情感状态）"""
         # 从文件加载长期记忆
         try:
             if self.memory_file_path.exists():
@@ -78,12 +87,39 @@ class PersonificationManager:
         except Exception as e:
             logger.error(f"[PersonificationManager] 加载长期记忆失败: {e}")
 
+        # 从文件加载会话数据（对话历史 + 情感状态 + 元信息）
+        try:
+            if self.session_data_file_path.exists():
+                with open(self.session_data_file_path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                self.message_history = data.get('message_history', {})
+                self.status_cache = data.get('status_cache', {})
+                self.session_meta = data.get('session_meta', {})
+                hist_count = sum(len(v) for v in self.message_history.values())
+                logger.info(f"[PersonificationManager] 加载了 {len(self.message_history)} 个会话, {hist_count} 条消息历史, {len(self.status_cache)} 个情感状态")
+                
+                # 启动时清理长时间未互动的会话情感状态
+                await self._cleanup_expired_sessions()
+            else:
+                logger.info("[PersonificationManager] 会话数据文件不存在，从零开始")
+        except Exception as e:
+            logger.error(f"[PersonificationManager] 加载会话数据失败: {e}")
+
     async def handle_message(self, event: AstrMessageEvent):
         """处理收到的消息"""
         try:
             sender_id = event.get_sender_id()
             is_group = bool(event.get_group_id())  # 如果有group_id则是群聊
             session_id = event.get_group_id() if is_group else sender_id
+
+            # 过滤机器人自己的消息（防止平台回传导致自循环重复发言）
+            try:
+                self_id = event.get_self_id()
+                if self_id and sender_id == self_id:
+                    logger.debug(f"[PersonificationManager] Session {session_id} 忽略机器人自身消息")
+                    return
+            except Exception:
+                pass
 
             # 过滤空消息（如手机端「用户正在输入中」的状态提示，NaoCat 等平台会发送空消息）
             message_str = event.message_str
@@ -95,6 +131,14 @@ class PersonificationManager:
             if self._is_muted(session_id):
                 logger.debug(f"[PersonificationManager] Session {session_id} 处于闭嘴状态")
                 return
+
+            # 检查是否包含不需要回复的词语
+            if self._check_ignore_keywords(message_str):
+                logger.debug(f"[PersonificationManager] Session {session_id} 消息包含不需要回复的词语，忽略")
+                return
+
+            # 检查会话是否过期（长时间未互动则清空情感状态并降低好感度）
+            await self._check_session_expiry(session_id, sender_id)
 
             # 检查是否处于休息状态（可能触发唤醒）
             is_resting = self._is_resting(session_id)
@@ -126,6 +170,12 @@ class PersonificationManager:
                 logger.debug(f"[PersonificationManager] Session {session_id} 不需要回复")
                 return
 
+            # 说话频率检查：除被@和预设触发外，冷却期内不回复
+            if trigger_reason not in ("mentioned", "next_reply_trigger", "private_chat"):
+                if self._is_in_speak_cooldown(session_id):
+                    logger.debug(f"[PersonificationManager] Session {session_id} 在说话冷却中，跳过回复")
+                    return
+
             # 阻止AstrBot的默认LLM回复
             event.stop_event()
             # 设置标志，确保后续阶段也不会处理
@@ -151,6 +201,15 @@ class PersonificationManager:
                 del self.mute_state[session_id]
         return False
 
+    def _is_in_speak_cooldown(self, session_id: str) -> bool:
+        """检查是否在说话冷却中（防止频繁发言）"""
+        if session_id in self.speak_cooldown_state:
+            if time.time() < self.speak_cooldown_state[session_id]:
+                return True
+            else:
+                del self.speak_cooldown_state[session_id]
+        return False
+
     def _check_mute_keywords(self, message: str, session_id: str) -> bool:
         """检查是否包含闭嘴关键词"""
         if not self.mute_keywords:
@@ -163,6 +222,16 @@ class PersonificationManager:
                 self.mute_state[session_id] = time.time() + mute_time
                 return True
 
+        return False
+
+    def _check_ignore_keywords(self, message: str) -> bool:
+        """检查消息是否包含不需要回复的词语"""
+        ignore_keywords = self.config.get('ignore_keywords', [])
+        if not ignore_keywords:
+            return False
+        for keyword in ignore_keywords:
+            if keyword in message:
+                return True
         return False
 
     async def _save_message_to_history(self, event: AstrMessageEvent, session_id: str):
@@ -189,6 +258,101 @@ class PersonificationManager:
         max_messages = self.config.get('max_messages', 40)
         if len(self.message_history[session_id]) > max_messages:
             self.message_history[session_id] = self.message_history[session_id][-max_messages:]
+
+        # 更新会话元信息（最后互动时间）
+        self.session_meta[session_id] = {
+            'last_interaction_time': timestamp,
+            'last_sender_id': sender_id
+        }
+
+    async def _save_bot_reply_to_history(self, messages: list, session_id: str, event: AstrMessageEvent):
+        """将机器人自己的回复保存到消息历史，让后续对话能看到自己说过什么"""
+        if session_id not in self.message_history:
+            self.message_history[session_id] = []
+
+        # 获取机器人自身标识
+        try:
+            bot_id = event.get_self_id()
+        except Exception:
+            bot_id = "bot"
+        bot_name = self.character_name or "Bot"
+
+        timestamp = time.time()
+
+        for msg in messages:
+            if msg['type'] == 'text' and msg.get('content'):
+                content = msg['content'].strip()
+                if content:
+                    self.message_history[session_id].append({
+                        'sender_id': bot_id,
+                        'sender_name': bot_name,
+                        'content': content,
+                        'timestamp': timestamp,
+                        'is_bot': True
+                    })
+
+        # 限制历史记录数量（与用户消息共用同一个上限）
+        max_messages = self.config.get('max_messages', 40)
+        if len(self.message_history[session_id]) > max_messages:
+            self.message_history[session_id] = self.message_history[session_id][-max_messages:]
+
+        # 更新会话元信息（机器人回复也算互动时间）
+        sender_id = event.get_sender_id()
+        self.session_meta[session_id] = {
+            'last_interaction_time': timestamp,
+            'last_sender_id': sender_id
+        }
+
+    # ============ 会话过期管理 ============
+
+    async def _check_session_expiry(self, session_id: str, sender_id: str):
+        """检查当前会话是否已过期（长时间未互动），过期则清空情感状态并降低好感度"""
+        meta = self.session_meta.get(session_id)
+        if not meta:
+            return
+
+        last_time = meta.get('last_interaction_time', 0)
+        if last_time <= 0:
+            return
+
+        expire_days = self.config.get('session_persistence', {}).get('status_expire_days', 5)
+        now = time.time()
+        if now - last_time < expire_days * 86400:
+            return  # 未过期
+
+        # 已过期：清空情感状态
+        if session_id in self.status_cache:
+            del self.status_cache[session_id]
+            logger.info(f"[PersonificationManager] Session {session_id} 超过 {expire_days} 天未互动，情感状态已清空")
+
+        # 降低好感度
+        decay = self.config.get('session_persistence', {}).get('affinity_decay_on_expire', -5)
+        if decay != 0 and sender_id:
+            current = await self.affinity_system.get_affinity(sender_id)
+            new_val = max(self.affinity_system.min_affinity, current + decay)
+            if new_val != current:
+                await self.affinity_system.set_affinity(sender_id, new_val)
+                logger.info(f"[PersonificationManager] 用户 {sender_id} 好感度因长时间未互动降低: {current} -> {new_val}")
+
+        # 立即保存变更
+        await self._save_persistent_data()
+
+    async def _cleanup_expired_sessions(self):
+        """启动时清理过期会话的情感状态（不降低好感度，由 _check_session_expiry 在下次互动时处理）"""
+        expire_days = self.config.get('session_persistence', {}).get('status_expire_days', 5)
+        now = time.time()
+        cleaned = 0
+
+        for session_id, meta in list(self.session_meta.items()):
+            last_time = meta.get('last_interaction_time', 0)
+            if last_time > 0 and now - last_time >= expire_days * 86400:
+                if session_id in self.status_cache:
+                    del self.status_cache[session_id]
+                    cleaned += 1
+                    logger.debug(f"[PersonificationManager] 启动时清理过期会话 {session_id} 的情感状态")
+
+        if cleaned > 0:
+            logger.info(f"[PersonificationManager] 启动时清理了 {cleaned} 个过期会话的情感状态")
 
     async def _should_reply(self, event: AstrMessageEvent, session_id: str) -> Tuple[bool, str]:
         """判断是否需要回复"""
@@ -274,26 +438,26 @@ class PersonificationManager:
     async def _generate_and_send_reply(self, event: AstrMessageEvent, session_id: str, trigger_reason: str):
         """生成并发送回复"""
         try:
-            logger.info(f"[PersonificationManager] 开始生成回复，trigger_reason={trigger_reason}")
+            logger.reply(f"开始生成回复，trigger_reason={trigger_reason}")
 
             # 判断是否是神志不清的唤醒模式
             is_groggy = (trigger_reason == "wakeup_groggy")
 
-            # 构建提示词
-            prompt = await self._build_prompt(event, session_id, trigger_reason)
+            # 构建提示词（分开返回 user_prompt 和 system_prompt）
+            user_prompt, system_prompt = await self._build_prompt(event, session_id, trigger_reason)
 
-            # 如果是唤醒模式，追加神志不清的额外提示
+            # 如果是唤醒模式，将神志不清提示追加到 system_prompt
             if is_groggy:
                 wakeup_config = self.config.get('rest', {}).get('wakeup', {})
                 groggy_prompt = wakeup_config.get('groggy_system_prompt', '你刚被吵醒，非常困，说话含糊不清，回复要短。')
-                prompt = f"{groggy_prompt}\n\n{prompt}"
+                system_prompt = f"{system_prompt}\n\n{groggy_prompt}"
                 logger.info("[PersonificationManager] 使用神志不清模式生成回复")
 
-            logger.debug(f"[PersonificationManager] 提示词长度: {len(prompt)}")
+            logger.prompt(f"User Prompt长度: {len(user_prompt)}, System Prompt长度: {len(system_prompt)}")
 
             # 调用LLM生成回复
-            reply_content = await self._call_llm(prompt)
-            logger.info(f"[PersonificationManager] LLM返回内容长度: {len(reply_content) if reply_content else 0}")
+            reply_content = await self._call_llm(user_prompt, system_prompt)
+            logger.reply(f"LLM返回内容长度: {len(reply_content) if reply_content else 0}")
 
             if not reply_content:
                 logger.warning("[PersonificationManager] LLM返回空回复")
@@ -313,9 +477,11 @@ class PersonificationManager:
 
             # 发送消息
             if 'messages' in parsed_reply and parsed_reply['messages']:
-                logger.info(f"[PersonificationManager] 准备发送 {len(parsed_reply['messages'])} 条消息")
+                logger.reply(f"准备发送 {len(parsed_reply['messages'])} 条消息")
                 await self._send_messages(parsed_reply['messages'], event, session_id)
                 logger.info("[PersonificationManager] 消息发送完成")
+                # 将机器人的回复保存到历史记录，让后续对话知道自己说过什么
+                await self._save_bot_reply_to_history(parsed_reply['messages'], session_id, event)
             else:
                 logger.warning("[PersonificationManager] 没有可发送的消息")
 
@@ -323,14 +489,28 @@ class PersonificationManager:
             if not is_groggy:
                 await self._update_affinity(event, parsed_reply)
 
+            # 设置说话冷却（支持固定秒数或 min/max 范围随机）
+            speak_cooldown_cfg = self.config.get('speak_cooldown', 30)
+            if isinstance(speak_cooldown_cfg, dict):
+                cd_min = speak_cooldown_cfg.get('min', 20)
+                cd_max = speak_cooldown_cfg.get('max', 60)
+                speak_cooldown = random.randint(cd_min, cd_max)
+            elif isinstance(speak_cooldown_cfg, (int, float)):
+                speak_cooldown = int(speak_cooldown_cfg)
+            else:
+                speak_cooldown = 30
+            if speak_cooldown > 0:
+                self.speak_cooldown_state[session_id] = time.time() + speak_cooldown
+                logger.debug(f"[PersonificationManager] Session {session_id} 进入说话冷却 {speak_cooldown} 秒")
+
             return None
 
         except Exception as e:
             logger.error(f"[PersonificationManager] 生成回复失败: {e}", exc_info=True)
             return None
 
-    async def _build_prompt(self, event: AstrMessageEvent, session_id: str, trigger_reason: str) -> str:
-        """构建提示词"""
+    async def _build_prompt(self, event: AstrMessageEvent, session_id: str, trigger_reason: str) -> tuple:
+        """构建提示词，返回 (user_prompt, system_prompt) 分开的元组"""
         # 获取当前时间
         current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
@@ -346,9 +526,9 @@ class PersonificationManager:
         # 预处理模板：将 {long_memory('guild')} 这样的函数调用替换为简单占位符
         processed_template = re.sub(r'\{long_memory\([^)]*\)\}', '{long_memory}', self.input_template)
 
-        # 填充模板
+        # 填充模板（这是 user_prompt）
         try:
-            prompt = processed_template.format(
+            user_prompt = processed_template.format(
                 time=current_time,
                 trigger_reason=trigger_reason,
                 history_new=history.get('recent', ''),
@@ -358,12 +538,12 @@ class PersonificationManager:
             )
         except KeyError as e:
             logger.warning(f"[PersonificationManager] 模板包含未知占位符: {e}")
-            prompt = processed_template
+            user_prompt = processed_template
 
-        # 添加系统提示
-        full_prompt = f"{self.system_prompt}\n\n{prompt}"
+        # 系统提示直接返回，不再拼接后拆分（避免 system 内部空行导致截断）
+        system_prompt = self.system_prompt
 
-        return full_prompt
+        return user_prompt, system_prompt
 
     def _format_history(self, session_id: str) -> dict:
         """格式化历史记录"""
@@ -406,7 +586,7 @@ class PersonificationManager:
             lines.append(f"{i}. [{dt}] {author}: {content}")
         return "\n".join(lines)
 
-    async def _call_llm(self, prompt: str) -> str:
+    async def _call_llm(self, user_prompt: str, system_prompt: str) -> str:
         """调用LLM生成回复"""
         try:
             # 使用AstrBot的Provider Manager调用LLM
@@ -420,16 +600,10 @@ class PersonificationManager:
                 logger.error("[PersonificationManager] 没有可用的LLM Provider")
                 return ""
 
-            # 分离 system_prompt 和 user_prompt
-            # prompt 格式为: "{system_prompt}\n\n{user_prompt}"
-            parts = prompt.split("\n\n", 1)
-            system_prompt = parts[0] if len(parts) > 1 else ""
-            user_prompt = parts[1] if len(parts) > 1 else prompt
-
             logger.info(f"[PersonificationManager] System Prompt长度: {len(system_prompt)}, 前50字符: {system_prompt[:50]}")
             logger.info(f"[PersonificationManager] User Prompt长度: {len(user_prompt)}, 前50字符: {user_prompt[:50]}")
 
-            # 调用LLM，传递 system_prompt
+            # 直接调用LLM，system_prompt 和 user_prompt 分别传递
             result = await curr_provider.text_chat(
                 prompt=user_prompt,
                 session_id="personification_temp",
@@ -653,9 +827,22 @@ class PersonificationManager:
             logger.info(f"[PersonificationManager] 用户 {user_id} 因好感度过低被自动拉黑")
 
     async def _send_messages(self, messages: list, event: AstrMessageEvent, session_id: str):
-        """发送消息"""
-        for message in messages:
+        """发送消息（先模拟打字延迟，再发送）"""
+        for i, message in enumerate(messages):
             try:
+                # 模拟打字延迟：发送前等待，模拟思考和键入时间
+                typing_base = self.config.get('typing_time', 3)
+                typing_per_char = self.config.get('typing_per_char', 0.1)
+                char_count = len(message.get('content', ''))
+                if i == 0:
+                    # 第一条消息：思考延迟 + 打字延迟
+                    delay = typing_base + typing_per_char * char_count
+                else:
+                    # 后续消息：仅打字延迟（思考时间已包含在第一条）
+                    delay = typing_per_char * char_count
+                await asyncio.sleep(delay)
+
+                # 延迟结束后再发送
                 if message['type'] == 'text':
                     await self._send_text_message(message['content'], event)
                 elif message['type'] == 'image':
@@ -663,25 +850,18 @@ class PersonificationManager:
                 elif message['type'] == 'voice':
                     await self._send_voice_message(message, event)
 
-                # 模拟打字延迟（基础延迟 + 按字数延迟）
-                typing_base = self.config.get('typing_time', 3)
-                typing_per_char = self.config.get('typing_per_char', 0.1)
-                char_count = len(message.get('content', ''))
-                delay = typing_base + typing_per_char * char_count
-                await asyncio.sleep(delay)
-
             except Exception as e:
                 logger.error(f"[PersonificationManager] 发送消息失败: {e}")
 
     async def _send_text_message(self, content: str, event: AstrMessageEvent):
         """发送文本消息"""
         if content:
-            logger.info(f"[PersonificationManager] 发送文本消息: {content[:50]}...")
+            logger.reply(f"发送文本消息: {content[:50]}...")
             from astrbot.core.message.components import Plain
             from astrbot.core.message.message_event_result import MessageChain
             try:
                 await event.send(MessageChain([Plain(content)]))
-                logger.info("[PersonificationManager] 文本消息发送成功")
+                logger.reply("文本消息发送成功")
             except Exception as e:
                 logger.error(f"[PersonificationManager] 发送消息失败: {e}")
 
@@ -731,7 +911,7 @@ class PersonificationManager:
         logger.info("[PersonificationManager] 已关闭")
 
     async def _save_persistent_data(self):
-        """保存持久化数据"""
+        """保存持久化数据（长期记忆 + 会话历史 + 情感状态 + 元信息）"""
         # 保存长期记忆到文件
         try:
             self.memory_file_path.parent.mkdir(parents=True, exist_ok=True)
@@ -740,6 +920,21 @@ class PersonificationManager:
             logger.info(f"[PersonificationManager] 长期记忆已保存到 {self.memory_file_path}")
         except Exception as e:
             logger.error(f"[PersonificationManager] 保存长期记忆失败: {e}")
+
+        # 保存会话数据（对话历史 + 情感状态 + 元信息）到文件
+        try:
+            self.session_data_file_path.parent.mkdir(parents=True, exist_ok=True)
+            data = {
+                'message_history': self.message_history,
+                'status_cache': self.status_cache,
+                'session_meta': self.session_meta
+            }
+            with open(self.session_data_file_path, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+            hist_count = sum(len(v) for v in self.message_history.values())
+            logger.info(f"[PersonificationManager] 会话数据已保存到 {self.session_data_file_path} ({len(self.message_history)} 会话, {hist_count} 条消息, {len(self.status_cache)} 状态)")
+        except Exception as e:
+            logger.error(f"[PersonificationManager] 保存会话数据失败: {e}")
 
     # ============ 休息系统 ============
 

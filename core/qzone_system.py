@@ -7,7 +7,7 @@ import random
 import time
 from datetime import datetime
 from typing import List, Optional
-from astrbot.api import logger
+from .plugin_logger import logger
 
 from .qzone_adapter import QZoneAdapter
 

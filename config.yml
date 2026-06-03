@@ -425,6 +425,8 @@ affinity:
 qzone:
   # 是否启用QQ空间自动发送功能
   enabled: false
+  # QQ空间Cookie（必填，从浏览器F12获取，用于登录QQ空间）
+  cookies_str: ""
   # 发帖间隔（小时）
   post_interval_hours: 6
   # 发帖时间范围（24小时制）
@@ -439,15 +441,60 @@ qzone:
     - "心情不错，来发个动态"
     - "今天的天气真好"
     - "时间在{time}，日期是{date}，记录一下"
+  # 下面的配置由QQ空间插件内部使用，保持默认即可
+  manage_group: ""
+  pillowmd_style_dir: ""
+  llm:
+    post_provider_id: ""
+    post_prompt: ""
+    comment_provider_id: ""
+    comment_prompt: ""
+    reply_provider_id: ""
+    reply_prompt: ""
+  source:
+    ignore_groups: []
+    ignore_users: []
+    post_max_msg: 20
+  trigger:
+    publish_cron: "0 0 * * *"
+    publish_offset: 0
+    comment_cron: "0 0 * * *"
+    comment_offset: 0
+    read_prob: 0.3
+    send_admin: false
+    like_when_comment: false
+  timeout: 30
+  show_name: true
+
+# 日志级别（控制插件输出详细程度）
+# 可选值：无 / DEBUG / Waring / 简单(默认) / 普通 / 详细 / ALL
+log_level: "简单"
 
 # 行为控制配置
 max_messages: 40          # 最大历史消息数
 activity_threshold: 0.3   # 群聊活跃度触发阈值（0-1）
 mute_time: 60             # 闭嘴时长（单位：秒）
 
-# 模拟打字延迟配置
-typing_time: 3            # 每条消息之间的打字延迟（单位：秒）
-typing_per_char: 0.1      # 按字数计算的打字延迟（单位：秒/字），与typing_time叠加使用
+# 不需要回复的词语（私聊或群聊中，消息包含这些词语时不回复、不保存、不参与唤醒计数）
+ignore_keywords:
+  - "签到"
+  - "打卡"
+
+# 会话持久化配置（对话历史、情感状态保存到本地 JSON 文件）
+session_persistence:
+  # 情感状态过期天数：超过此天数未互动则清空该会话的情感状态并降低好感度
+  status_expire_days: 5
+  # 过期后好感度降低量（负值）
+  affinity_decay_on_expire: -5
+
+# 模拟打字延迟配置（每次回复前等待，模拟思考和打字时间）
+typing_time: 3            # 首条消息前的思考延迟（单位：秒）
+typing_per_char: 0.1      # 按字数计算的打字延迟（单位：秒/字）
+
+# 说话频率配置（冷却时间内不再主动回复，被@或私聊不受限制）
+speak_cooldown:
+  min: 3                  # 每次回复后冷却时间最小值（单位：秒）
+  max: 50                 # 每次回复后冷却时间最大值（单位：秒），随机取 min~max 之间的值
 
 # 休息系统配置
 rest:

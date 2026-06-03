@@ -10,7 +10,7 @@ from typing import Optional
 
 from astrbot.api.event import filter, AstrMessageEvent, MessageEventResult
 from astrbot.api.star import Context, Star, register
-from astrbot.api import logger
+from .core.plugin_logger import logger
 from astrbot.core.message.components import Plain, Image, At
 
 from .core.personification_manager import PersonificationManager

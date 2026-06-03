@@ -9,7 +9,8 @@ qq_dir = Path(__file__).parent.parent.parent.parent / "QQ"
 if str(qq_dir) not in sys.path:
     sys.path.insert(0, str(qq_dir))
 
-from astrbot.api import logger
+from .plugin_logger import logger
+from astrbot.core.provider.entities import ProviderType
 
 
 class QZoneAdapter:
@@ -25,7 +26,7 @@ class QZoneAdapter:
         self.session = None
         self.service = None
         self.db = None
-        self.llm_action = None
+        self.llm = None
         self.sender = None
         
         # 配置参数
@@ -41,17 +42,60 @@ class QZoneAdapter:
         try:
             logger.info("[QZoneAdapter] 正在初始化QQ空间适配器...")
             
-            # 动态导入QQ模块
+            # 从 personification config 的 qzone 节提取 QQ 插件所需配置
+            qzone_cfg = self.config.get('qzone', {})
+            
+            # 构建一个完整的配置字典，包含 QQ 插件 PluginConfig 需要的所有字段
+            full_config = {
+                'manage_group': qzone_cfg.get('manage_group', ''),
+                'pillowmd_style_dir': qzone_cfg.get('pillowmd_style_dir', ''),
+                'cookies_str': qzone_cfg.get('cookies_str', ''),
+                'timeout': qzone_cfg.get('timeout', 30),
+                'show_name': qzone_cfg.get('show_name', True),
+            }
+            
+            # llm 子配置
+            llm_cfg = qzone_cfg.get('llm', {})
+            full_config['llm'] = {
+                'post_provider_id': llm_cfg.get('post_provider_id', ''),
+                'post_prompt': llm_cfg.get('post_prompt', ''),
+                'comment_provider_id': llm_cfg.get('comment_provider_id', ''),
+                'comment_prompt': llm_cfg.get('comment_prompt', ''),
+                'reply_provider_id': llm_cfg.get('reply_provider_id', ''),
+                'reply_prompt': llm_cfg.get('reply_prompt', ''),
+            }
+            
+            # source 子配置
+            source_cfg = qzone_cfg.get('source', {})
+            full_config['source'] = {
+                'ignore_groups': source_cfg.get('ignore_groups', []),
+                'ignore_users': source_cfg.get('ignore_users', []),
+                'post_max_msg': source_cfg.get('post_max_msg', 20),
+            }
+            
+            # trigger 子配置
+            trigger_cfg = qzone_cfg.get('trigger', {})
+            full_config['trigger'] = {
+                'publish_cron': trigger_cfg.get('publish_cron', '0 0 * * *'),
+                'publish_offset': trigger_cfg.get('publish_offset', 0),
+                'comment_cron': trigger_cfg.get('comment_cron', '0 0 * * *'),
+                'comment_offset': trigger_cfg.get('comment_offset', 0),
+                'read_prob': trigger_cfg.get('read_prob', 0.3),
+                'send_admin': trigger_cfg.get('send_admin', False),
+                'like_when_comment': trigger_cfg.get('like_when_comment', False),
+            }
+            
+            # 动态导入 QQ 模块
+            from astrbot.core import AstrBotConfig
             from core.config import PluginConfig
             from core.qzone import QzoneAPI, QzoneSession
             from core.db import PostDB
             from core.llm_action import LLMAction
             from core.sender import Sender
             from core.service import PostService
-            from astrbot.core import AstrBotConfig
             
             # 创建配置对象
-            qq_config = AstrBotConfig(self.config)
+            qq_config = AstrBotConfig(full_config)
             plugin_config = PluginConfig(qq_config, self.context)
             
             # 初始化会话
@@ -65,7 +109,7 @@ class QZoneAdapter:
             await self.db.initialize()
             
             # 初始化LLM动作生成器
-            self.llm_action = LLMAction(plugin_config)
+            self.llm = LLMAction(plugin_config)
             
             # 初始化发送器
             self.sender = Sender(plugin_config)
@@ -75,7 +119,7 @@ class QZoneAdapter:
                 self.qzone_api,
                 self.session,
                 self.db,
-                self.llm_action
+                self.llm
             )
             
             logger.info("[QZoneAdapter] QQ空间适配器初始化完成")
@@ -87,56 +131,62 @@ class QZoneAdapter:
     async def generate_qzone_content(self) -> str:
         """生成符合角色设定的QQ空间内容
         
-        使用拟人化插件的配置和角色设定来生成内容
+        与主插件使用相同的角色设定和状态上下文，确保拟人化一致
         
         Returns:
             生成的说说内容
         """
         try:
-            # 获取角色设定（从config读取，无默认值）
-            system_prompt = self.config.get('system', '')
+            # 获取完整的角色设定（原样传给 system_prompt，与主插件一致）
+            character_system = self.config.get('system', '')
             character_name = self.config.get('name') or '我'
             
-            # 构建提示词，让AI根据角色设定生成内容
-            prompt = f"""你是{character_name}，现在要发一条QQ空间动态。
+            # 获取当前角色状态（与主插件使用相同的 status 上下文）
+            current_status = self.config.get('status', '')
+            if self.personification_manager and hasattr(self.personification_manager, 'default_status'):
+                current_status = self.personification_manager.default_status
+            
+            # 构建 user_prompt（包含状态上下文，与主插件的拟人化一致）
+            user_prompt = f"""你现在要发一条QQ空间动态。
 
-请基于以下角色设定生成内容：
-{system_prompt[:500]}  # 限制长度
+你当前的状态：
+{current_status}
 
 要求：
-1. 完全符合角色的说话风格和性格
-2. 内容自然、真实，像真人发的动态
-3. 长度适中（20-100字）
-4. 可以包含日常生活的点滴、心情、感悟
-5. 不要使用Markdown格式
-6. 直接返回动态内容，不要有其他说明
-7. 如果角色有特殊的说话习惯（如句尾加"喵~"），一定要保留
+1. 完全符合你的角色设定和说话风格
+2. 根据你当前的心情和状态自然表达
+3. 内容自然、真实，像真人发的动态
+4. 长度适中（20-100字）
+5. 可以包含日常生活的点滴、心情、感悟
+6. 不要使用Markdown格式
+7. 直接返回动态内容，不要有其他说明
 
 当前时间：{self._get_current_time()}
 
 请生成一条QQ空间动态："""
             
-            # 调用LLM
+            # 调用LLM（完整角色设定作为 system_prompt，与主插件一致）
             provider_manager = self.context.provider_manager
-            curr_provider = provider_manager.curr_provider
+            curr_provider = provider_manager.get_using_provider(ProviderType.CHAT_COMPLETION)
             
             if not curr_provider:
                 logger.warning("[QZoneAdapter] 没有可用的LLM Provider")
                 return self._get_default_content()
             
             result = await curr_provider.text_chat(
-                prompt=prompt,
-                session_id="qzone_generate"
+                prompt=user_prompt,
+                session_id="personification_temp",
+                system_prompt=character_system
             )
             
-            content = result.get('completion', '') if result else ''
+            content = result.completion_text if result else ''
             
             if content:
                 content = content.strip()
                 # 限制长度
                 if len(content) > 200:
                     content = content[:200] + "..."
-                logger.info(f"[QZoneAdapter] 生成QQ空间内容: {content[:50]}...")
+                logger.reply(f"生成QQ空间内容: {content[:50]}...")
                 return content
             else:
                 return self._get_default_content()
@@ -335,40 +385,46 @@ class QZoneAdapter:
             生成的评论内容
         """
         try:
-            character_name = self.config.get('name', '我')
-            system_prompt = self.config.get('system', '')
+            character_system = self.config.get('system', '')
             
-            prompt = f"""你是{character_name}，看到了一条QQ空间动态，需要发表评论。
+            # 获取当前角色状态
+            current_status = self.config.get('status', '')
+            if self.personification_manager and hasattr(self.personification_manager, 'default_status'):
+                current_status = self.personification_manager.default_status
+            
+            user_prompt = f"""你看到了一条QQ空间动态，需要发表评论。
 
-角色设定：
-{system_prompt[:500]}
+你当前的状态：
+{current_status}
 
 动态内容：
-{text}
+{post.text}
 
 图片：{', '.join(post.images[:3]) if post.images else '无'}
 
 要求：
-1. 评论要符合角色的性格和说话风格
-2. 简短自然（10-50字）
-3. 可以是赞美、调侃、共鸣等
-4. 不要使用Markdown格式
-5. 直接返回评论内容
+1. 评论要符合你的角色性格和说话风格
+2. 根据你当前的心情和状态自然表达
+3. 简短自然（10-50字）
+4. 可以是赞美、调侃、共鸣等
+5. 不要使用Markdown格式
+6. 直接返回评论内容
 
 请生成评论："""
             
             provider_manager = self.context.provider_manager
-            curr_provider = provider_manager.curr_provider
+            curr_provider = provider_manager.get_using_provider(ProviderType.CHAT_COMPLETION)
             
             if not curr_provider:
                 return "不错不错~"
             
             result = await curr_provider.text_chat(
-                prompt=prompt,
-                session_id="qzone_comment"
+                prompt=user_prompt,
+                session_id="personification_temp",
+                system_prompt=character_system
             )
             
-            content = result.get('completion', '') if result else ''
+            content = result.completion_text if result else ''
             
             if content:
                 return content.strip()[:100]
@@ -401,6 +457,9 @@ class QZoneAdapter:
         logger.info("[QZoneAdapter] 正在关闭...")
         
         if self.qzone_api:
-            await self.qzone_api.close()
+            try:
+                await self.qzone_api.close()
+            except Exception:
+                pass
         
         logger.info("[QZoneAdapter] 已关闭")
