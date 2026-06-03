@@ -491,8 +491,9 @@ class PersonificationManager:
 
             # 对消息做拟人化处理：拆分长消息，使其更像真人分段发送
             if 'messages' in parsed_reply and parsed_reply['messages']:
+                is_group_chat = bool(event.get_group_id())
                 parsed_reply['messages'] = self._humanize_messages(
-                    parsed_reply['messages'], is_group
+                    parsed_reply['messages'], is_group_chat
                 )
                 logger.reply(f"准备发送 {len(parsed_reply['messages'])} 条消息")
                 await self._send_messages(parsed_reply['messages'], event, session_id)
