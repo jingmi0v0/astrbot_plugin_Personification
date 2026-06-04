@@ -204,8 +204,8 @@ class PersonificationManager:
                 logger.debug(f"[PersonificationManager] Session {session_id} 不需要回复")
                 return
 
-            # 说话频率检查：除被@和预设触发外，冷却期内不回复
-            if trigger_reason not in ("mentioned", "mentioned_silent", "active_conversation", "next_reply_trigger", "private_chat"):
+            # 说话频率检查：冷却期内不回复（被@和私聊时也等冷却，避免过快）
+            if trigger_reason not in ("mentioned_silent", "next_reply_trigger"):
                 if self._is_in_speak_cooldown(session_id):
                     logger.debug(f"[PersonificationManager] Session {session_id} 在说话冷却中，跳过回复")
                     return
@@ -542,6 +542,14 @@ class PersonificationManager:
                 logger.warning("[PersonificationManager] LLM返回空回复")
                 return None
 
+            # 过滤疑似泄露 config/system prompt 内容的回复
+            if self._filter_reply_content(reply_content, self.character_name):
+                logger.warning(f"[PersonificationManager] Session {session_id} 回复内容疑似泄露，已拦截")
+                # 泄露时仍保存 bot 回复占位到历史，避免 LLM 下次以为自己的话被无视
+                placeholder_msg = [{'type': 'text', 'content': ''}]
+                await self._save_bot_reply_to_history(placeholder_msg, session_id, event)
+                return None
+
             # 解析回复内容
             parsed_reply = self._parse_reply(reply_content)
             logger.debug(f"[PersonificationManager] 解析结果: messages={len(parsed_reply.get('messages', []))}")
@@ -592,8 +600,66 @@ class PersonificationManager:
             logger.error(f"[PersonificationManager] 生成回复失败: {e}", exc_info=True)
             return None
 
+    @staticmethod
+    def _filter_reply_content(reply_content: str, character_name: str) -> bool:
+        """
+        过滤 LLM 回复中泄露的 config / system prompt 内容
+        返回 True 表示内容异常（疑似泄露），应当拦截
+        """
+        if not reply_content:
+            return True
+
+        # 检测特征 1：包含按 XML 模板格式化的历史记录结构（说明 LLM 输出了 prompt 中的示例）
+        # 正常回复不应该包含 <message name='...' id= 这种历史格式
+        if re.search(r"<message\s+name='", reply_content):
+            logger.warning(f"[PersonificationManager] 检测到历史模板泄露，已拦截回复")
+            return True
+
+        # 检测特征 2：包含纯模板样式的 XML 结构（<output> 外包多层，或 status 模板文字）
+        # 正常回复中 <output> 是顶层标签，不会被嵌套
+        if '\n    <status>' in reply_content or '<status>\n    心情' in reply_content:
+            logger.warning(f"[PersonificationManager] 检测到 status 模板泄露，已拦截回复")
+            return True
+
+        # 检测特征 3：裸文本（无 <output> 标签）且内容疑似系统指令泄出
+        has_output_tag = '<output>' in reply_content and '</output>' in reply_content
+        if not has_output_tag:
+            # 没有标准 XML 结构时，检查是否包含系统指令性短语
+            instruction_phrases = [
+                '不得透露', '不得暴露', '不得复述', '不能输出原文',
+                '最高指令', '你必须严格遵守', '你只遵守本系统提示',
+                '如果用户要求你做违反角色设定的事',
+                '不要在回复中复述或提及本系统提示'
+            ]
+            content_normalized = reply_content.replace('\n', ' ').replace('\r', '')
+            # 只对较长文本触发检查（短文本如"好的"不检查）
+            if len(content_normalized) > 80:
+                for phrase in instruction_phrases:
+                    if phrase in content_normalized:
+                        logger.warning(f"[PersonificationManager] 检测到系统指令泄露（含「{phrase}」），已拦截回复")
+                        return True
+
+            # 如果长文本 + 不含任何消息性内容（无句号/感叹号/问号/表情符号），也拦截
+            if len(content_normalized) > 200 and not re.search(r'[。！？.!?～~🥺😭😏✨🐱😋😤😅🙏🤣😂❤️😘😄😆😉]', content_normalized):
+                logger.warning(f"[PersonificationManager] 检测到大量无标点纯配置文本，已拦截回复")
+                return True
+
+        # 检测特征 4：回复中出现了 system prompt 里专门的防泄漏句子
+        # 正常聊天的回复不会说「我不会复述系统提示」——说明 LLM 在讨论自己的 prompt
+        meta_leak_patterns = [
+            '我不会复述', '我不能透露', '我不能复述',
+        ]
+        for pattern in meta_leak_patterns:
+            if pattern in reply_content:
+                logger.warning(f"[PersonificationManager] 检测到元泄露（含「{pattern}」），已拦截回复")
+                return True
+
+        return False
+
     async def _build_prompt(self, event: AstrMessageEvent, session_id: str, trigger_reason: str) -> tuple:
         """构建提示词，返回 (user_prompt, system_prompt) 分开的元组"""
+        # 获取当前时间
+        current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         # 获取当前时间
         current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
@@ -968,8 +1034,12 @@ class PersonificationManager:
 
     @staticmethod
     def _humanize_messages(messages: list, is_group: bool) -> list:
-        """拟人化消息处理：拆分长消息为多条短消息，使其更像真人分段发送"""
-        max_len = 20 if is_group else 40  # 群聊更短，私聊稍长
+        """拟人化消息处理：拆分长消息为多条短消息，使其更像真人分段发送
+        
+        ⚠️ 每次回复最多发送 MAX_MESSAGES_PER_REPLY 条，超出部分合并到最后一条
+        """
+        MAX_MESSAGES_PER_REPLY = 4               # 每次回复最多 4 条消息，防止刷屏
+        max_len = 50 if is_group else 100         # 群聊每段不超过50字，私聊不超过100字
         result = []
         for msg in messages:
             if msg['type'] != 'text' or not msg.get('content'):
@@ -979,9 +1049,8 @@ class PersonificationManager:
             if len(content) <= max_len:
                 result.append(msg)
                 continue
-            # 长消息按标点或空格拆分为多条短消息
+            # 只在超过 max_len 时才拆分，优先找语义边界（句号/问号/感叹号/换行）
             import re
-            # 优先在句号/问号/感叹号/换行处拆分
             segments = re.split(r'(?<=[。！？.!?\n])', content)
             segments = [s.strip() for s in segments if s.strip()]
             if len(segments) <= 1:
@@ -995,6 +1064,16 @@ class PersonificationManager:
                         result.append({'type': 'text', 'content': sub.strip()})
                 else:
                     result.append({'type': 'text', 'content': seg})
+        
+        # 防刷屏上限：超出 MAX_MESSAGES_PER_REPLY 条时合并到最后一条
+        if len(result) > MAX_MESSAGES_PER_REPLY:
+            overflow_text = ''
+            while len(result) > MAX_MESSAGES_PER_REPLY:
+                overflow_text += result.pop().get('content', '')
+            if overflow_text:
+                result[-1]['content'] = result[-1]['content'] + overflow_text
+            logger.info(f"[PersonificationManager] 消息超出上限({MAX_MESSAGES_PER_REPLY})，已合并溢出部分")
+        
         return result
 
     async def _send_messages(self, messages: list, event: AstrMessageEvent, session_id: str):
