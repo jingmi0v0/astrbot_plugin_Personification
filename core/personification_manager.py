@@ -76,6 +76,9 @@ class PersonificationManager:
         # 活跃对话状态（被@一次后保持回复，无需重复@）
         self.active_conversations: Dict[str, dict] = {}  # session_id -> {user_id, other_msgs_count, last_reply_time}
 
+        # 唤醒后逐渐恢复计数器（神志不清 → 正常）
+        self._groggy_recovery_count: Dict[str, int] = {}  # session_id -> 已发groggy消息数
+
     async def initialize(self):
         """初始化拟人化管理器"""
         # 设置日志级别配置提供器
@@ -526,11 +529,29 @@ class PersonificationManager:
             user_prompt, system_prompt = await self._build_prompt(event, session_id, trigger_reason)
 
             # 如果是唤醒模式，将神志不清提示追加到 system_prompt
+            # 并根据已回复次数逐渐恢复清醒
             if is_groggy:
-                wakeup_config = self.config.get('rest', {}).get('wakeup', {})
-                groggy_prompt = wakeup_config.get('groggy_system_prompt', '你刚被吵醒，非常困，说话含糊不清，回复要短。')
-                system_prompt = f"{system_prompt}\n\n{groggy_prompt}"
-                logger.info("[PersonificationManager] 使用神志不清模式生成回复")
+                groggy_count = self._groggy_recovery_count.get(session_id, 0) + 1
+                self._groggy_recovery_count[session_id] = groggy_count
+                recovery_msgs = self.config.get('wakeup_groggy_recovery_msgs', 3)
+
+                if groggy_count <= recovery_msgs:
+                    # 逐渐清醒：第1条最神志不清，之后逐步恢复
+                    grogginess = max(0, 1.0 - (groggy_count - 1) / recovery_msgs)
+                    wakeup_config = self.config.get('rest', {}).get('wakeup', {})
+                    base_groggy = wakeup_config.get('groggy_system_prompt', '你刚被吵醒，非常困，说话含糊不清，回复要短。')
+                    if grogginess > 0.7:
+                        level = "非常困，意识模糊"
+                    elif grogginess > 0.3:
+                        level = "有点醒了，但还迷糊"
+                    else:
+                        level = "基本清醒，稍微有点困"
+                    groggy_prompt = f"{base_groggy}\n当前清醒程度：{level}"
+                    system_prompt = f"{system_prompt}\n\n{groggy_prompt}"
+                    logger.info(f"[PersonificationManager] 使用神志不清模式 (#{groggy_count}/{recovery_msgs}, 清醒度{level})")
+                else:
+                    # 已完全恢复
+                    logger.info(f"[PersonificationManager] 唤醒模式已恢复 (#{groggy_count})")
 
             logger.prompt(f"User Prompt长度: {len(user_prompt)}, System Prompt长度: {len(system_prompt)}")
 
@@ -557,6 +578,9 @@ class PersonificationManager:
             # 更新状态（唤醒模式下不更新状态，保持睡觉状态）
             if not is_groggy and 'status' in parsed_reply:
                 self.status_cache[session_id] = parsed_reply['status']
+                # 同时更新用户级状态（跨对话共享情感）
+                sender_id = event.get_sender_id()
+                self.status_cache[f"user_{sender_id}"] = parsed_reply['status']
 
             # 执行动作（唤醒模式下不执行动作，太困了）
             if not is_groggy and 'actions' in parsed_reply:
@@ -564,10 +588,20 @@ class PersonificationManager:
 
             # 对消息做拟人化处理：拆分长消息，使其更像真人分段发送
             if 'messages' in parsed_reply and parsed_reply['messages']:
+                # 防止刷屏：硬限制单次回复最多 3 条消息
+                max_msgs_per_reply = self.config.get('max_msgs_per_reply', 3)
+                if len(parsed_reply['messages']) > max_msgs_per_reply:
+                    parsed_reply['messages'] = parsed_reply['messages'][:max_msgs_per_reply]
+                    logger.warning(f"[PersonificationManager] 消息数超过上限，截断为 {max_msgs_per_reply} 条")
+
                 is_group_chat = bool(event.get_group_id())
                 parsed_reply['messages'] = self._humanize_messages(
                     parsed_reply['messages'], is_group_chat
                 )
+                # 再次截断，防止 _humanize_messages 拆分后超出限制
+                if len(parsed_reply['messages']) > max_msgs_per_reply:
+                    parsed_reply['messages'] = parsed_reply['messages'][:max_msgs_per_reply]
+                    logger.warning(f"[PersonificationManager] _humanize 后仍超出，二次截断为 {max_msgs_per_reply} 条")
                 logger.reply(f"准备发送 {len(parsed_reply['messages'])} 条消息")
                 await self._send_messages(parsed_reply['messages'], event, session_id)
                 logger.info("[PersonificationManager] 消息发送完成")
@@ -648,11 +682,31 @@ class PersonificationManager:
         # 正常聊天的回复不会说「我不会复述系统提示」——说明 LLM 在讨论自己的 prompt
         meta_leak_patterns = [
             '我不会复述', '我不能透露', '我不能复述',
+            '我是AI', '我是人工智能', '我是一个AI',
+            '我无法透露', '我没有办法告诉你',
         ]
         for pattern in meta_leak_patterns:
             if pattern in reply_content:
                 logger.warning(f"[PersonificationManager] 检测到元泄露（含「{pattern}」），已拦截回复")
                 return True
+
+        # 检测特征 5：回复中包含大段的 '#' 开头的 YAML/配置格式内容
+        # 正常聊天不会出现 Markdown 标题格式的多行内容
+        yaml_lines = [line for line in reply_content.split('\n') if line.strip().startswith('#')]
+        if len(yaml_lines) >= 3:
+            logger.warning(f"[PersonificationManager] 检测到 YAML 配置泄露（{len(yaml_lines)}行#注释），已拦截回复")
+            return True
+
+        # 检测特征 6：回复中包含格式化会话记录 [用户] 或 [Bot名] 格式的伪日志
+        # 正常聊天不会出现这种带标签的系统消息格式
+        if re.search(r'\[.*?\]\s*(正在|已经|已|✅|❤️|📝|⚠️)', reply_content):
+            logger.warning("[PersonificationManager] 检测到伪日志格式泄露，已拦截回复")
+            return True
+
+        # 检测特征 7：回复中出现类似 XML 历史记录的标签（没有外层 <output> 包裹）
+        if '<message' in reply_content and '<output>' not in reply_content:
+            logger.warning("[PersonificationManager] 检测到未包裹的 XML 消息泄露，已拦截回复")
+            return True
 
         return False
 
@@ -660,20 +714,26 @@ class PersonificationManager:
         """构建提示词，返回 (user_prompt, system_prompt) 分开的元组"""
         # 获取当前时间
         current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        # 获取当前时间
-        current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
         # 获取历史记录
         history = self._format_history(session_id)
 
-        # 获取状态
-        status = self.status_cache.get(session_id, self.default_status)
+        # 获取状态（优先用户级跨对话状态，其次当前会话级）
+        sender_id = event.get_sender_id()
+        status = (
+            self.status_cache.get(f"user_{sender_id}")
+            or self.status_cache.get(session_id)
+            or self.default_status
+        )
 
-        # 获取长期记忆（如果有）
-        long_memory = await self._get_long_memory(session_id)
+        # 获取长期记忆（跨对话：合并 session + user + global 三层记忆）
+        long_memory = await self._get_long_memory(session_id, sender_id)
 
         # 预处理模板：将 {long_memory('guild')} 这样的函数调用替换为简单占位符
         processed_template = re.sub(r'\{long_memory\([^)]*\)\}', '{long_memory}', self.input_template)
+
+        # 获取跨对话历史（最近3小时此用户在其他会话的消息）
+        cross_history = self._get_cross_session_history(sender_id, session_id, hours=3.0)
 
         # 填充模板（这是 user_prompt）
         try:
@@ -689,6 +749,10 @@ class PersonificationManager:
             logger.warning(f"[PersonificationManager] 模板包含未知占位符: {e}")
             user_prompt = processed_template
 
+        # 如果存在跨对话历史，追加到 user_prompt 末尾
+        if cross_history:
+            user_prompt += "\n\n# 此用户最近在其他会话中的消息（跨对话上下文）\n" + cross_history
+
         # 系统提示直接返回，不再拼接后拆分
         system_prompt = self.system_prompt
 
@@ -697,9 +761,15 @@ class PersonificationManager:
         if safety_rules:
             system_prompt += f"\n\n{safety_rules}"
 
-        # 安全防线：非被@/提及触发的回复（如活跃度随机插话），禁止骂回去
-        # 只有明确被@或提到名字时，才可能是在骂你
-        if trigger_reason and not trigger_reason.startswith("mentioned"):
+        # 睡眠前过渡期：即将进入休息时段时，加入疲态提示
+        if trigger_reason != "wakeup_groggy" and self._is_near_rest():
+            pre_rest_prompt = self.config.get('pre_rest_system_prompt', '').strip()
+            if pre_rest_prompt:
+                system_prompt += f"\n\n{pre_rest_prompt}"
+
+        # 安全防线：仅活跃度随机插话时，禁止骂回去
+        # 活跃对话、私聊、被@时对方就是在对你说话，不需要此限制
+        if trigger_reason and trigger_reason.startswith("activity_trigger"):
             system_prompt += (
                 "\n\n"
                 "## 重要：本次回复是随机插话\n"
@@ -777,19 +847,88 @@ class PersonificationManager:
             'last': last_text
         }
 
-    async def _get_long_memory(self, session_id: str) -> str:
-        """获取长期记忆"""
-        memories = self.long_memory.get(session_id, [])
-        if not memories:
+    def _get_cross_session_history(self, sender_id: str, current_session_id: str, hours: float = 3.0) -> str:
+        """获取用户在其他会话中的最近消息（跨对话上下文）
+
+        只包含此用户在其他会话中自己发的消息，不包含其他人的消息。
+        时间范围：最近 N 小时。
+        """
+        cutoff = time.time() - hours * 3600
+        msgs = []
+        # 收集所有会话中此用户的消息
+        for sid, history in self.message_history.items():
+            if sid == current_session_id:
+                continue  # 跳过当前会话（已在 history_new 中）
+            for msg in history:
+                if msg.get('sender_id') != sender_id:
+                    continue
+                ts = msg.get('timestamp', 0)
+                if ts < cutoff:
+                    continue
+                content = msg.get('content', '')
+                if not content.strip():
+                    continue
+                msgs.append((ts, content))
+
+        if not msgs:
             return ""
-        # 格式化输出所有记忆
+
+        # 按时间排序，取最近 10 条
+        msgs.sort(key=lambda x: x[0])
+        msgs = msgs[-10:]
+
         lines = []
-        for i, mem in enumerate(memories, 1):
+        for ts, content in msgs:
+            dt = datetime.fromtimestamp(ts).strftime('%H:%M')
+            lines.append(f"[{dt}] 用户说: {content}")
+        return "\n".join(lines)
+
+    async def _get_long_memory(self, session_id: str, sender_id: str = None) -> str:
+        """获取长期记忆（跨对话：合并 session + user + global 三层）
+
+        分层设计：
+          - global：全部场景共享的记忆（通用知识、角色自身的记忆）
+          - user_{sender_id}：同用户跨群聊/私聊共享的记忆
+          - session_id：当前会话独有的记忆
+        """
+        # 收集三层记忆
+        all_memories = []
+        seen = set()
+
+        # 1. 全局共享
+        for mem in self.long_memory.get("global", []):
+            key = mem.get('content', '')
+            if key not in seen:
+                seen.add(key)
+                all_memories.append((mem, '全局'))
+
+        # 2. 用户级别（跨群聊/私聊）
+        if sender_id:
+            user_key = f"user_{sender_id}"
+            for mem in self.long_memory.get(user_key, []):
+                key = mem.get('content', '')
+                if key not in seen:
+                    seen.add(key)
+                    all_memories.append((mem, '用户'))
+
+        # 3. 当前会话
+        for mem in self.long_memory.get(session_id, []):
+            key = mem.get('content', '')
+            if key not in seen:
+                seen.add(key)
+                all_memories.append((mem, '会话'))
+
+        if not all_memories:
+            return ""
+
+        # 格式化输出
+        lines = []
+        for i, (mem, source) in enumerate(all_memories, 1):
             content = mem.get('content', '')
             author = mem.get('author', 'unknown')
             ts = mem.get('timestamp', 0)
             dt = datetime.fromtimestamp(ts).strftime('%m-%d %H:%M') if ts else 'unknown'
-            lines.append(f"{i}. [{dt}] {author}: {content}")
+            lines.append(f"{i}. [{dt}] [{source}] {author}: {content}")
         return "\n".join(lines)
 
     async def _call_llm(self, user_prompt: str, system_prompt: str) -> str:
@@ -852,9 +991,19 @@ class PersonificationManager:
         if output_match:
             result['messages'] = self._parse_messages(output_match.group(1))
 
-        # 如果没有找到标签，将整个内容作为消息
+        # 如果没有找到 <output> 标签，说明 LLM 没按格式输出
+        # 不能直接把整段内容当消息发——可能包含内部格式、状态等泄露信息
         if not result['messages']:
-            result['messages'] = [{'type': 'text', 'content': reply_content.strip()}]
+            # 清理掉已知的内部格式标签
+            cleaned = reply_content
+            for tag in ('status', 'think', 'action'):
+                cleaned = re.sub(rf'<{tag}>.*?</{tag}>', '', cleaned, flags=re.DOTALL)
+            # 只保留可能的消息文本（去掉纯标点/空行）
+            cleaned = cleaned.strip()
+            if cleaned:
+                result['messages'] = [{'type': 'text', 'content': cleaned}]
+            else:
+                logger.warning("[PersonificationManager] LLM 未按格式输出且清理后为空，已拦截")
 
         return result
 
@@ -976,7 +1125,7 @@ class PersonificationManager:
                 elif action['type'] == 'affinity':
                     await self._execute_affinity_update(action, event)
                 elif action['type'] == 'memory_add':
-                    await self._execute_memory_add(session_id, action['content'], sender_name)
+                    await self._execute_memory_add(session_id, action['content'], sender_name, event.get_sender_id())
                     memory_changed = True
                 elif action['type'] == 'memory_delete':
                     await self._execute_memory_delete(session_id, action['index'])
@@ -1038,7 +1187,7 @@ class PersonificationManager:
         
         ⚠️ 每次回复最多发送 MAX_MESSAGES_PER_REPLY 条，超出部分合并到最后一条
         """
-        MAX_MESSAGES_PER_REPLY = 4               # 每次回复最多 4 条消息，防止刷屏
+        MAX_MESSAGES_PER_REPLY = 2               # 每次回复最多 2 条消息，防止刷屏
         max_len = 50 if is_group else 100         # 群聊每段不超过50字，私聊不超过100字
         result = []
         for msg in messages:
@@ -1108,6 +1257,12 @@ class PersonificationManager:
                     await self._send_image_message(message, event)
                 elif message['type'] == 'voice':
                     await self._send_voice_message(message, event)
+
+                # 多条消息之间的额外间隔（防止连发像刷屏）
+                if len(messages) > 1 and i < len(messages) - 1:
+                    inter_msg = self.config.get('inter_msg_delay', 2)
+                    if inter_msg > 0:
+                        await asyncio.sleep(inter_msg)
 
             except Exception as e:
                 logger.error(f"[PersonificationManager] 发送消息失败: {e}")
@@ -1281,6 +1436,7 @@ class PersonificationManager:
                 del self.awake_state[session_id]
                 # 重置消息计数
                 self.rest_message_count.pop(session_id, None)
+                self._groggy_recovery_count.pop(session_id, None)
                 logger.info(f"[PersonificationManager] Session {session_id} 唤醒时间结束，重新入睡")
         return False
 
@@ -1358,6 +1514,31 @@ class PersonificationManager:
 
     # _generate_groggy_reply 已废弃 — groggy 逻辑已内联到 _generate_and_send_reply 中
 
+    # ============ 过渡期管理 ============
+
+    def _is_near_rest(self) -> bool:
+        """检查是否即将进入固定休息时段（用于触发疲态过渡）"""
+        pre_rest = self.config.get('pre_rest_notice_minutes', 10)
+        if not pre_rest or pre_rest <= 0:
+            return False
+        now = datetime.now()
+        rest_config = self.config.get('rest', {}).get('fixed', {})
+        if not rest_config.get('enabled', False):
+            return False
+        now_minutes = now.hour * 60 + now.minute
+        for schedule in rest_config.get('schedules', []):
+            start_str = schedule.get('start', '')
+            if not start_str:
+                continue
+            try:
+                start_h, start_m = map(int, start_str.split(':'))
+                start_minutes = start_h * 60 + start_m
+                if 0 < start_minutes - now_minutes <= pre_rest:
+                    return True
+            except (ValueError, AttributeError):
+                continue
+        return False
+
     # ============ 活跃对话管理 ============
 
     def _check_conversation_end(self, message_str: str, session_id: str):
@@ -1432,6 +1613,11 @@ class PersonificationManager:
             reply_content = await self._call_llm(user_prompt, self.system_prompt)
             if not reply_content:
                 logger.warning("[PersonificationManager] 沉默@回复 LLM 返回空")
+                return
+
+            # 过滤疑似泄露的内容
+            if self._filter_reply_content(reply_content, self.character_name):
+                logger.warning("[PersonificationManager] 沉默@回复疑似泄露，已拦截")
                 return
 
             # 发送 @回复
@@ -1554,6 +1740,11 @@ class PersonificationManager:
                 logger.warning("[PersonificationManager] 无厘头消息回复 LLM 返回空")
                 return
 
+            # 过滤疑似泄露的内容
+            if self._filter_reply_content(reply_content, self.character_name):
+                logger.warning("[PersonificationManager] 无厘头回复疑似泄露，已拦截")
+                return
+
             # 发送回复
             from astrbot.core.message.components import Plain
             from astrbot.core.message.message_event_result import MessageChain
@@ -1570,17 +1761,28 @@ class PersonificationManager:
     
     # ============ 长期记忆操作 ============
     
-    async def _execute_memory_add(self, session_id: str, content: str, author: str):
-        """添加长期记忆"""
-        if session_id not in self.long_memory:
-            self.long_memory[session_id] = []
-        
-        self.long_memory[session_id].append({
+    async def _execute_memory_add(self, session_id: str, content: str, author: str, sender_id: str = None):
+        """添加长期记忆（同时写入 session 层和 user 层，实现跨对话记忆）"""
+        entry = {
             'content': content,
             'timestamp': time.time(),
             'author': author
-        })
-        logger.info(f"[PersonificationManager] 添加长期记忆到 {session_id}: {content[:30]}...")
+        }
+
+        # 1. 写入当前会话层
+        if session_id not in self.long_memory:
+            self.long_memory[session_id] = []
+        self.long_memory[session_id].append(entry)
+
+        # 2. 同时写入用户层（跨群聊/私聊共享）
+        if sender_id:
+            user_key = f"user_{sender_id}"
+            if user_key not in self.long_memory:
+                self.long_memory[user_key] = []
+            self.long_memory[user_key].append(entry)
+            logger.info(f"[PersonificationManager] 添加长期记忆到 {session_id} + {user_key}: {content[:30]}...")
+        else:
+            logger.info(f"[PersonificationManager] 添加长期记忆到 {session_id}: {content[:30]}...")
     
     async def _execute_memory_delete(self, session_id: str, index: int):
         """删除长期记忆"""
