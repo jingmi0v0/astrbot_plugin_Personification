@@ -95,6 +95,8 @@ class PersonificationPlugin(Star):
                 event.stop_event()
         except Exception as e:
             logger.error(f"[Personification] 处理消息失败: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
 
     @filter.command("重载配置")
     @filter.permission_type(filter.PermissionType.ADMIN)
@@ -159,31 +161,43 @@ class PersonificationPlugin(Star):
     @filter.command("发说说")
     @filter.permission_type(filter.PermissionType.ADMIN)
     async def publish_qzone(self, event: AstrMessageEvent, content: str = None):
-        if not self.qzone_system or not self.qzone_system.enabled:
-            yield event.plain_result("QQ空间系统未启用（config.yml 中 qzone.enabled: true）")
-            return
-        result = await self.qzone_system.qzone_adapter.publish_post(content=content)
-        if result.get('success'):
-            yield event.plain_result(f"✅ 成功发布QQ空间动态\n\n{result.get('content', '')}")
-        else:
-            yield event.plain_result(f"❌ 发布失败: {result.get('error')}")
+        try:
+            if not self.qzone_system or not self.qzone_system.enabled:
+                yield event.plain_result("QQ空间系统未启用（config.yml 中 qzone.enabled: true）")
+                return
+            result = await self.qzone_system.qzone_adapter.publish_post(content=content)
+            if result.get('success'):
+                yield event.plain_result(f"✅ 成功发布QQ空间动态\n\n{result.get('content', '')}")
+            else:
+                yield event.plain_result(f"❌ 发布失败: {result.get('error')}")
+        except Exception as e:
+            import traceback
+            tb = traceback.format_exc()
+            logger.error(f"[Personification] 发说说失败: {e}\n{tb}")
+            yield event.plain_result(f"❌ 发说说失败: {e}")
 
     @filter.command("看说说")
     async def view_qzone(self, event: AstrMessageEvent, num: int = 3):
-        if not self.qzone_system or not self.qzone_system.enabled:
-            yield event.plain_result("QQ空间系统未启用（config.yml 中 qzone.enabled: true）")
-            return
-        feeds = await self.qzone_system.qzone_adapter.get_recent_feeds(num=num)
-        if not feeds:
-            yield event.plain_result("暂无动态")
-            return
-        result = f"📱 最近的QQ空间动态（共{len(feeds)}条）:\n\n"
-        for i, feed in enumerate(feeds, 1):
-            result += f"{i}. {feed['text'][:50]}...\n"
-            if feed.get('images'):
-                result += f"   🖼️ {len(feed['images'])}张图片\n"
-            result += f"   💬 {feed['comments_count']}条评论\n\n"
-        yield event.plain_result(result)
+        try:
+            if not self.qzone_system or not self.qzone_system.enabled:
+                yield event.plain_result("QQ空间系统未启用（config.yml 中 qzone.enabled: true）")
+                return
+            feeds = await self.qzone_system.qzone_adapter.get_recent_feeds(num=num)
+            if not feeds:
+                yield event.plain_result("暂无动态")
+                return
+            result = f"📱 最近的QQ空间动态（共{len(feeds)}条）:\n\n"
+            for i, feed in enumerate(feeds, 1):
+                result += f"{i}. {feed['text'][:50]}...\n"
+                if feed.get('images'):
+                    result += f"   🖼️ {len(feed['images'])}张图片\n"
+                result += f"   💬 {feed['comments_count']}条评论\n\n"
+            yield event.plain_result(result)
+        except Exception as e:
+            import traceback
+            tb = traceback.format_exc()
+            logger.error(f"[Personification] 看说说失败: {e}\n{tb}")
+            yield event.plain_result(f"❌ 看说说失败: {e}")
 
     async def terminate(self):
         if self.qzone_system:

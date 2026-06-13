@@ -88,7 +88,7 @@ class QZoneAdapter:
                 from .qq_plugin.llm_action import LLMAction
                 from .qq_plugin.sender import Sender
                 from .qq_plugin.service import PostService, Post
-            except ModuleNotFoundError:
+            except Exception:
                 logger.warning("[QZoneAdapter] QQ 插件模块加载失败，使用内置桩模块")
                 _using_stubs = True
                 from .qq_stubs.config import PluginConfig
@@ -146,7 +146,7 @@ class QZoneAdapter:
             
         except Exception as e:
             logger.error(f"[QZoneAdapter] 初始化失败: {e}", exc_info=True)
-            raise
+            self.enabled = False
     
     async def generate_qzone_content(self) -> str:
         """生成符合角色设定的QQ空间内容
