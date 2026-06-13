@@ -9,8 +9,6 @@ from datetime import datetime
 from typing import List, Optional
 from .plugin_logger import logger
 
-from .qzone_adapter import QZoneAdapter
-
 
 class QZoneSystem:
     """QQ空间系统，负责自动发送QQ空间动态"""
@@ -20,7 +18,8 @@ class QZoneSystem:
         self.config = config
         self.personification_manager = personification_manager
         
-        # QQ空间适配器
+        # QQ空间适配器（惰性导入，避免依赖外部 QQ 插件导致加载失败）
+        from .qzone_adapter import QZoneAdapter
         self.adapter = QZoneAdapter(context, config, personification_manager)
         
         # 定时任务

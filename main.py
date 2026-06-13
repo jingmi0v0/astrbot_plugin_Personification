@@ -3,16 +3,10 @@ ARSTBOT 拟人化插件主入口
 实现类似 chatluna-character 的拟人化聊天功能
 """
 import asyncio
-import sys
 import time
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
-
-# 将插件根目录加入 Python 路径，防止重载时相对导入失败
-_plugin_dir = str(Path(__file__).resolve().parent)
-if _plugin_dir not in sys.path:
-    sys.path.insert(0, _plugin_dir)
 
 from astrbot.api.event import filter, AstrMessageEvent, MessageEventResult
 from astrbot.api.star import Context, Star, register
