@@ -504,6 +504,7 @@ safety_rules: |
 # 行为控制配置
 max_messages: 40          # 最大历史消息数
 max_msgs_per_reply: 2     # 单次回复最多几条消息（防止刷屏，硬限制）
+max_msg_length: 30        # 单条消息最多几个字（超过截断）
 activity_threshold: 0.3   # 群聊活跃度触发阈值（0-1）
 mute_time: 60             # 闭嘴时长（单位：秒）
 

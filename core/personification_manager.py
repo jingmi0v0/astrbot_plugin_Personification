@@ -602,6 +602,20 @@ class PersonificationManager:
                 if len(parsed_reply['messages']) > max_msgs_per_reply:
                     parsed_reply['messages'] = parsed_reply['messages'][:max_msgs_per_reply]
                     logger.warning(f"[PersonificationManager] _humanize 后仍超出，二次截断为 {max_msgs_per_reply} 条")
+                # 每条消息的长度上限（防止个别LLM输出过长消息）
+                max_msg_len = self.config.get('max_msg_length', 30)
+                # 过滤消息正文中的 XML 动作标签（如 <affinity delta="10" ...） 
+                for msg in parsed_reply['messages']:
+                    if msg['type'] == 'text' and msg.get('content'):
+                        # 移除消息中的 XML 动作标签
+                        msg['content'] = re.sub(r'<affinity\s+[^>]*/>', '', msg['content'])
+                        msg['content'] = re.sub(r'<poke\s+[^>]*/>', '', msg['content'])
+                        msg['content'] = re.sub(r'<emoji\s+[^>]*/>', '', msg['content'])
+                        msg['content'] = msg['content'].strip()
+                        if len(msg['content']) > max_msg_len:
+                            msg['content'] = msg['content'][:max_msg_len]
+                            logger.debug(f"[PersonificationManager] 单条消息截断至 {max_msg_len} 字")
+
                 logger.reply(f"准备发送 {len(parsed_reply['messages'])} 条消息")
                 await self._send_messages(parsed_reply['messages'], event, session_id)
                 logger.info("[PersonificationManager] 消息发送完成")
@@ -1268,13 +1282,26 @@ class PersonificationManager:
                 logger.error(f"[PersonificationManager] 发送消息失败: {e}")
 
     async def _send_text_message(self, content: str, event: AstrMessageEvent):
-        """发送文本消息"""
+        """发送文本消息（发送前做最终清洗，防止XML/状态/格式泄露）"""
         if content:
-            logger.reply(f"发送文本消息: {content[:50]}...")
+            # 最终清洗：移除所有残留的 XML 动作标签
+            cleaned = re.sub(r'<[a-zA-Z]+\s+[^>]*/>', '', content)
+            # 移除泄露的 status 文本（LLM 有时会忘记用 <status> 标签包裹）
+            cleaned = re.sub(
+                r'\n{2,}心情[：:].*?\n\s*状态[：:].*?\n\s*记忆[：:].*?\n\s*动作[：:].*',
+                '', cleaned, flags=re.DOTALL
+            )
+            # 压缩多余空行（超过2个换行缩为2个）
+            cleaned = re.sub(r'\n{3,}', '\n\n', cleaned)
+            cleaned = cleaned.strip()
+            if not cleaned:
+                logger.warning("[PersonificationManager] 消息内容清洗后为空，跳过发送")
+                return
+            logger.reply(f"发送文本消息: {cleaned[:50]}...")
             from astrbot.core.message.components import Plain
             from astrbot.core.message.message_event_result import MessageChain
             try:
-                await event.send(MessageChain([Plain(content)]))
+                await event.send(MessageChain([Plain(cleaned)]))
                 logger.reply("文本消息发送成功")
             except Exception as e:
                 logger.error(f"[PersonificationManager] 发送消息失败: {e}")
