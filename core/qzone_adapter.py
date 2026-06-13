@@ -1,15 +1,9 @@
 """
-QQ空间适配器 - 将QQ文件夹的源码适配到拟人化插件
+QQ空间适配器 - 适配本地 QQ 插件模块或内置桩模块
 """
-import sys
 from pathlib import Path
-
-# 添加QQ目录到Python路径
-qq_dir = Path(__file__).parent.parent.parent.parent / "QQ"
-if str(qq_dir) not in sys.path:
-    sys.path.insert(0, str(qq_dir))
-
-from .plugin_logger import logger
+from astrbot.api import logger
+from astrbot.core.utils.astrbot_path import get_astrbot_data_path
 from astrbot.core.provider.entities import ProviderType
 
 
@@ -85,19 +79,17 @@ class QZoneAdapter:
                 'like_when_comment': trigger_cfg.get('like_when_comment', False),
             }
             
-            # 动态导入 QQ 模块（QQ/ 目录已在模块顶部加入 sys.path）
-            # 或降级到内置桩模块
+            # 动态导入内置的 QQ 插件模块或降级到桩模块
             _using_stubs = False
             try:
-                from astrbot.core import AstrBotConfig
-                from core.config import PluginConfig
-                from core.qzone import QzoneAPI, QzoneSession
-                from core.db import PostDB
-                from core.llm_action import LLMAction
-                from core.sender import Sender
-                from core.service import PostService, Post
+                from .qq_plugin.config import PluginConfig
+                from .qq_plugin.qzone import QzoneAPI, QzoneSession
+                from .qq_plugin.db import PostDB
+                from .qq_plugin.llm_action import LLMAction
+                from .qq_plugin.sender import Sender
+                from .qq_plugin.service import PostService, Post
             except ModuleNotFoundError:
-                logger.warning("[QZoneAdapter] QQ 插件未安装，使用内置桩模块")
+                logger.warning("[QZoneAdapter] QQ 插件模块加载失败，使用内置桩模块")
                 _using_stubs = True
                 from .qq_stubs.config import PluginConfig
                 from .qq_stubs.qzone import QzoneAPI, QzoneSession
@@ -106,13 +98,26 @@ class QZoneAdapter:
             
             # 创建配置对象
             if _using_stubs:
-                # 桩模式下，PluginConfig 接受普通 dict
                 plugin_config = PluginConfig(full_config, self.context)
             else:
+                # 写临时配置文件（AstrBotConfig 需要文件路径）
+                _tmp_cfg_path = Path(get_astrbot_data_path()) / "plugins" / "personification_qzone_tmp.json"
+                import json as _json
+                _tmp_cfg_path.parent.mkdir(parents=True, exist_ok=True)
+                _tmp_cfg_path.write_text(_json.dumps(full_config, ensure_ascii=False), encoding="utf-8")
                 from astrbot.core import AstrBotConfig as _ABC
-                qq_config = _ABC(full_config)
+                qq_config = _ABC(str(_tmp_cfg_path))
                 plugin_config = PluginConfig(qq_config, self.context)
             
+            # 自动从 AstrBot 平台注入 CQHttp client（aiocqhttp 已登录，不需要手动配 cookie）
+            try:
+                platform = self.context.get_platform("aiocqhttp")
+                if platform and hasattr(platform, 'bot'):
+                    plugin_config.client = platform.bot
+                    logger.info("[QZoneAdapter] 已自动获取 QQ bot client，cookies 将自动获取")
+            except Exception:
+                pass
+
             # 初始化会话
             self.session = QzoneSession(plugin_config)
             

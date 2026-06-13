@@ -1,17 +1,13 @@
 """
-拟人化插件核心模块
+拟人化插件核心模块 — 基于 chatluna-character 架构
 """
-from .personification_manager import PersonificationManager
-from .affinity_system import AffinitySystem
-from .blacklist_manager import BlacklistManager
-from .qzone_system import QZoneSystem
-
-# QZoneAdapter 不在此处导入（依赖外部 QQ 插件，非必需）
-# 在 qzone_system.py 中按需惰性导入
-
-__all__ = [
-    'PersonificationManager',
-    'AffinitySystem',
-    'BlacklistManager',
-    'QZoneSystem',
-]
+from .message_collector import MessageCollector
+from .chat_pipeline import ChatPipeline
+from .filter import ActivitySystem
+from .rest import RestSystem
+from .trigger import TriggerStore
+from .response_parser import parse_response, clean_response_text
+from .types import Message, GroupLock, PresetTemplate
+from .preset import Preset, PresetLoader
+from .affinity import AffinitySystem
+from .blacklist import BlacklistManager
