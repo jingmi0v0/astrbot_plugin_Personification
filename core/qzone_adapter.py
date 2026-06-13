@@ -85,14 +85,22 @@ class QZoneAdapter:
                 'like_when_comment': trigger_cfg.get('like_when_comment', False),
             }
             
-            # 动态导入 QQ 模块
-            from astrbot.core import AstrBotConfig
-            from core.config import PluginConfig
-            from core.qzone import QzoneAPI, QzoneSession
-            from core.db import PostDB
-            from core.llm_action import LLMAction
-            from core.sender import Sender
-            from core.service import PostService
+            # 动态导入 QQ 模块（QQ/ 目录已在模块顶部加入 sys.path）
+            # 或降级到内置桩模块
+            try:
+                from astrbot.core import AstrBotConfig
+                from core.config import PluginConfig
+                from core.qzone import QzoneAPI, QzoneSession
+                from core.db import PostDB
+                from core.llm_action import LLMAction
+                from core.sender import Sender
+                from core.service import PostService, Post
+            except ModuleNotFoundError:
+                logger.warning("[QZoneAdapter] QQ 插件未安装，使用内置桩模块")
+                from .qq_stubs.config import PluginConfig
+                from .qq_stubs.qzone import QzoneAPI, QzoneSession
+                from .qq_stubs.db import PostDB
+                from .qq_stubs.service import LLMAction, Sender, PostService, Post
             
             # 创建配置对象
             qq_config = AstrBotConfig(full_config)
@@ -217,8 +225,6 @@ class QZoneAdapter:
                 raise ValueError("内容和图片不能同时为空")
             
             # 调用服务层发布
-            from core.model import Post
-            
             post = await self.service.publish_post(
                 text=content,
                 images=images or []
