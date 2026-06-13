@@ -21,6 +21,7 @@ class QZoneSystem:
         # QQ空间适配器（惰性导入，避免依赖外部 QQ 插件导致加载失败）
         from .qzone_adapter import QZoneAdapter
         self.adapter = QZoneAdapter(context, config, personification_manager)
+        self.qzone_adapter = self.adapter  # 别名，兼容 main.py 调用
         
         # 定时任务
         self.post_scheduler_task = None
