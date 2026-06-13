@@ -15,6 +15,9 @@ class Post:
         self.create_time = create_time or time.time()
         self.comments = comments or []
         self.likes = likes
+        self.uin = 0
+        self.name = "本地"
+        self.status = "approved"
 
     def to_dict(self):
         return {"tid": self.tid, "text": self.text, "images": self.images,
@@ -28,7 +31,6 @@ class Post:
 
 class PostDB:
     """本地 JSON 文件存储"""
-
     def __init__(self, config=None):
         self.config = config
         self._data_path = Path(get_astrbot_data_path()) / "plugins" / "personification_qzone.json"
@@ -52,14 +54,14 @@ class PostDB:
         await self._save()
         return post
 
+    async def save(self, post):
+        """兼容 QQ 插件接口"""
+        self._posts.insert(0, post.to_dict() if hasattr(post, 'to_dict') else {"tid": str(time.time()), "text": str(post)})
+        self._trim()
+        await self._save()
+
     async def get_recent_posts(self, limit=5) -> list[Post]:
         return [Post.from_dict(p) for p in self._posts[:limit]]
-
-    async def get_post_by_tid(self, tid) -> Post | None:
-        for p in self._posts:
-            if p["tid"] == str(tid):
-                return Post.from_dict(p)
-        return None
 
     async def add_comment(self, tid, comment_text):
         for p in self._posts:
@@ -76,6 +78,9 @@ class PostDB:
                 await self._save()
                 return True
         return False
+
+    async def get(self, value, key="id"):
+        return None
 
     async def close(self):
         pass

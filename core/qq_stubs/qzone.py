@@ -3,32 +3,35 @@ from astrbot.api import logger
 
 
 class QzoneSession:
-    """本地模式不需要真实会话"""
+    """会话（本地模式 — 无真实 QQ 登录）"""
     def __init__(self, config):
-        self.config = config
-        logger.info("[QZoneLocal] 本地 QQ 空间模式已启用")
+        self.cfg = config
+        logger.info("[QZoneLocal] 本地 QQ 空间模式（无真实 QQ 登录）")
 
-    async def login(self):
-        return True
+    async def get_ctx(self):
+        return None
+
+    async def get_uin(self):
+        return 0
+
+    async def get_nickname(self):
+        return "本地模式"
+
+    async def invalidate(self):
+        pass
+
+    async def login(self, cookies_str=None):
+        return None
 
     async def close(self):
         pass
 
 
 class QzoneAPI:
-    """QQ 空间 API（本地模式，操作本地数据）"""
+    """API（本地模式）"""
     def __init__(self, session, config):
         self.session = session
-        self.config = config
+        self.cfg = config
 
-    async def publish_post(self, text="", images=None):
-        return {"success": True, "tid": str(int(time.time() * 1000))[-12:]}
-
-    async def get_recent_feeds(self, num=5):
-        return []
-
-    async def like_post(self, tid):
-        return {"success": True}
-
-    async def comment_post(self, tid, text):
-        return {"success": True}
+    async def close(self):
+        pass

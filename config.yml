@@ -446,7 +446,7 @@ affinity:
 qzone:
   # 是否启用QQ空间自动发送功能
   enabled: false
-  # QQ空间Cookie（必填，从浏览器F12获取，用于登录QQ空间）
+  # QQ空间Cookie（已弃用，从浏览器F12获取，用于登录QQ空间）
   cookies_str: ""
   # 发帖间隔（小时）
   post_interval_hours: 6

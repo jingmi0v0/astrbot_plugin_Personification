@@ -87,6 +87,7 @@ class QZoneAdapter:
             
             # 动态导入 QQ 模块（QQ/ 目录已在模块顶部加入 sys.path）
             # 或降级到内置桩模块
+            _using_stubs = False
             try:
                 from astrbot.core import AstrBotConfig
                 from core.config import PluginConfig
@@ -97,14 +98,20 @@ class QZoneAdapter:
                 from core.service import PostService, Post
             except ModuleNotFoundError:
                 logger.warning("[QZoneAdapter] QQ 插件未安装，使用内置桩模块")
+                _using_stubs = True
                 from .qq_stubs.config import PluginConfig
                 from .qq_stubs.qzone import QzoneAPI, QzoneSession
                 from .qq_stubs.db import PostDB
                 from .qq_stubs.service import LLMAction, Sender, PostService, Post
             
             # 创建配置对象
-            qq_config = AstrBotConfig(full_config)
-            plugin_config = PluginConfig(qq_config, self.context)
+            if _using_stubs:
+                # 桩模式下，PluginConfig 接受普通 dict
+                plugin_config = PluginConfig(full_config, self.context)
+            else:
+                from astrbot.core import AstrBotConfig as _ABC
+                qq_config = _ABC(full_config)
+                plugin_config = PluginConfig(qq_config, self.context)
             
             # 初始化会话
             self.session = QzoneSession(plugin_config)
