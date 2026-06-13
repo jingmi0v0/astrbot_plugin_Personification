@@ -76,6 +76,13 @@ class ChatPipeline:
             sender_id, is_groggy
         )
 
+        # 1.5 在 prompt 后追加好感度和 MASTER（不在 _build_prompt 内避免变量作用域问题）
+        if affinity_value is not None:
+            system_prompt += f"\n\n当前与你对话的用户好感度：{affinity_value}（正数表示友好，负数表示讨厌）"
+        master_id = self.config.get('MASTERID', '')
+        if master_id:
+            system_prompt += f"\n\n主人的QQ号是{master_id}，如果主人来找你，你要特别听话"
+
         # 2. 调用 LLM
         reply = await self._call_llm(user_prompt, system_prompt)
         if not reply:
@@ -121,15 +128,6 @@ class ChatPipeline:
             user_prompt = template
 
         system_prompt = self.preset.system_prompt
-
-        # 当前用户好感度
-        if affinity_value is not None:
-            system_prompt += f"\n\n当前与你对话的用户好感度：{affinity_value}（正数表示友好，负数表示讨厌）"
-
-        # MASTER 信息注入
-        master_id = self.config.get('MASTERID', '')
-        if master_id:
-            system_prompt += f"\n\n主人的QQ号是{master_id}，如果主人来找你，你要特别听话"
 
         # 睡眠前疲态
         if not is_groggy and self._is_near_rest():
